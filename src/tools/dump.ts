@@ -66,25 +66,46 @@ async function runJob(spec: McpJobSpec): Promise<McpJobResult> {
   return job;
 }
 
-/** Dumps one NSE symbol: every catalogue job, in order, against the MCP server. */
+function pendingJob(spec: McpJobSpec): McpJobResult {
+  return {
+    label: spec.label,
+    tool: spec.tool,
+    ok: true,
+    error: null,
+    empty: true,
+    pending: true,
+    raw: "",
+    durationMs: 0,
+  };
+}
+
+/**
+ * Dumps one NSE symbol: every catalogue job, in order, against the MCP server.
+ *
+ * `deadlineAt` is a wall-clock cutoff for the whole pass. Once it passes, the
+ * remaining jobs are marked `pending` instead of being fired, so a slow MCP
+ * server degrades into a partial dump rather than an endless run.
+ */
 export async function dumpSymbol(
   symbol: string,
-  options: { consolidated?: boolean; limit?: number } = {}
+  options: { consolidated?: boolean; limit?: number; deadlineAt?: number } = {}
 ): Promise<SymbolDump> {
   const jobs = buildJobCatalog(symbol, options);
   const startedAt = Date.now();
+  const deadlineAt = options.deadlineAt ?? Infinity;
   log.info(`MCP dump ${symbol} (${jobs.length} calls)`);
 
   const results: McpJobResult[] = [];
   for (const spec of jobs) {
-    results.push(await runJob(spec));
+    results.push(Date.now() >= deadlineAt ? pendingJob(spec) : await runJob(spec));
   }
 
   const counts = {
     total: results.length,
-    ok: results.filter((job) => job.ok).length,
+    ok: results.filter((job) => job.ok && !job.pending).length,
     failed: results.filter((job) => !job.ok).length,
-    empty: results.filter((job) => job.empty).length,
+    empty: results.filter((job) => job.empty && !job.pending).length,
+    pending: results.filter((job) => job.pending).length,
   };
 
   const dump: McpDump = {
@@ -96,8 +117,13 @@ export async function dumpSymbol(
 
   log.info(
     `MCP dump ${symbol} done in ${formatDuration(Date.now() - startedAt)} ` +
-      `(ok ${counts.ok}, failed ${counts.failed}, empty ${counts.empty})`
+      `(ok ${counts.ok}, failed ${counts.failed}, empty ${counts.empty}` +
+      `${counts.pending ? `, pending ${counts.pending}` : ""})`
   );
+
+  if (counts.pending === counts.total) {
+    return { symbol, ok: false, pending: true, error: "run deadline reached before this symbol was dumped", data: dump };
+  }
 
   if (counts.failed === counts.total) {
     const first = results[0];

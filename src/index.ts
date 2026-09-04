@@ -36,6 +36,8 @@ Options:
   --out <file>                      also write the JSON document to this file
   --no-lock                         run even if another pass is in flight
   --quiet                           don't print the document (data/ is still written)
+  --print                           print every document in --cron mode (off by default:
+                                    a snapshot is megabytes, and data/ already has it)
   -h, --help                        this text
 
 Data is regenerated under ${DATA_DIR} on every run; MCP_ENDPOINT is ${MCP_ENDPOINT}.
@@ -74,6 +76,9 @@ export function parseArgs(argv: string[]): CliOptions {
         break;
       case "--quiet":
         raw["quiet"] = true;
+        break;
+      case "--print":
+        raw["print"] = true;
         break;
       case "--out": {
         const value = argv[++i];
@@ -121,9 +126,21 @@ async function runOnceMode(options: CliOptions): Promise<number> {
 }
 
 async function runCronMode(options: CliOptions): Promise<number> {
+  // A snapshot is megabytes of JSON and data/latest.json already holds it, so
+  // the scheduler logs a summary line to stderr instead of flooding stdout on
+  // every tick. --print (or --out) brings the document back.
+  const tickOptions: CliOptions = { ...options, quiet: options.quiet || !options.print };
+
   const handle = startScheduler(async () => {
     const result = await runOnce(options);
-    emit(result, options);
+    emit(result, tickOptions);
+    if (!options.symbolsOnly && "counts" in result) {
+      log.info(
+        `snapshot ${result.runId}: ${result.counts.nseSymbols} symbol(s), ` +
+          `${result.counts.mcpOk} dumped, ${result.counts.mcpFailed} failed, ` +
+          `${result.counts.mcpPending} pending${result.truncated ? " (deadline)" : ""}`
+      );
+    }
   });
 
   // Keep the process alive until the platform (or Ctrl-C) stops it, and let an

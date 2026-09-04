@@ -93,7 +93,12 @@ export const SYMBOL_CACHE_FILE = CACHE_ENABLED
 // --------------------------------------------------------------------------- //
 
 export const MCP_ENDPOINT = envString("MCP_ENDPOINT", "http://127.0.0.1:3123/mcp");
-export const MCP_TIMEOUT_MS = envNumber("MCP_TIMEOUT_MS", 60_000);
+/**
+ * Per MCP call. Deliberately short: 19 calls x N symbols means a generous
+ * timeout here is what turns one slow upstream into a pass that runs for ten
+ * minutes. A screener call that hasn't answered in 30s is not going to.
+ */
+export const MCP_TIMEOUT_MS = envNumber("MCP_TIMEOUT_MS", 30_000);
 /** How many symbols are dumped at once. Keep it low; the MCP server throttles upstream anyway. */
 export const MCP_CONCURRENCY = Math.max(1, envNumber("MCP_CONCURRENCY", 2));
 export const MCP_CONSOLIDATED = envBool("MCP_CONSOLIDATED", true);
@@ -106,6 +111,16 @@ export const MCP_LIST_LIMIT = envNumber("MCP_LIST_LIMIT", 10);
 // (works on Windows, where there is no crond); crontab.txt has the same cadence
 // for a POSIX host that would rather own the schedule itself.
 // --------------------------------------------------------------------------- //
+
+/**
+ * Hard ceiling on one pass, so a slow or half-dead MCP server can never run past
+ * the next tick. When it is hit, the symbols still queued come back as
+ * `pending` and the snapshot is marked `truncated` — a partial answer, written
+ * and returned on time, beats a run that never ends. 0 disables the ceiling.
+ *
+ * Keep it below CRON_SCHEDULE's interval; 4 minutes under a 5-minute cadence.
+ */
+export const RUN_DEADLINE_MS = envNumber("RUN_DEADLINE_MS", 4 * 60 * 1000);
 
 export const CRON_SCHEDULE = envString("CRON_SCHEDULE", "*/5 * * * *");
 export const CRON_TIMEZONE = envString("CRON_TIMEZONE", "Asia/Kolkata");

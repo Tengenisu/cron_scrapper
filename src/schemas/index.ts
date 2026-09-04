@@ -22,6 +22,8 @@ export const CliOptionsSchema = z.object({
   out: z.string().optional(),
   /** Suppress the JSON document on stdout (the cron writes files instead). */
   quiet: z.boolean().default(false),
+  /** Force the full document onto stdout in cron mode, which is quiet by default. */
+  print: z.boolean().default(false),
 });
 
 export type CliOptions = z.infer<typeof CliOptionsSchema>;

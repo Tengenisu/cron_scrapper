@@ -5,6 +5,7 @@ import {
   LOCK_STALE_MS,
   MCP_CONCURRENCY,
   MCP_ENDPOINT,
+  RUN_DEADLINE_MS,
   WRITE_DATA_FILES,
 } from "./constants.js";
 import { RunLock } from "./services/lock.js";
@@ -40,7 +41,8 @@ export async function runOnce(options: Pick<CliOptions, "section" | "enrich" | "
     if (WRITE_DATA_FILES) snapshot.files = writeSnapshot(snapshot);
     log.info(
       `run ${snapshot.runId} finished in ${formatDuration(snapshot.durationMs)} — ` +
-        `${snapshot.counts.nseSymbols} symbol(s), ${snapshot.counts.mcpFailed} MCP failure(s)`
+        `${snapshot.counts.nseSymbols} symbol(s), ${snapshot.counts.mcpFailed} MCP failure(s)` +
+        `${snapshot.truncated ? `, ${snapshot.counts.mcpPending} pending (deadline)` : ""}`
     );
     return snapshot;
   } catch (err) {
@@ -70,7 +72,10 @@ async function collect(
   const symbols = [...new Set(records.map((r) => r.nseSymbol).filter((s): s is string => Boolean(s)))].sort();
   log.info(`resolved ${symbols.length} NSE symbol(s): ${symbols.join(", ") || "—"}`);
 
-  const mcp = options.enrich ? await dumpSymbols(symbols) : [];
+  // Everything above is cheap; the MCP step is what can drag, so the deadline is
+  // measured from the start of the run and only ever cuts that step short.
+  const deadlineAt = RUN_DEADLINE_MS > 0 ? startedAt + RUN_DEADLINE_MS : Infinity;
+  const mcp = options.enrich ? await dumpSymbols(symbols, deadlineAt) : [];
 
   return {
     ok: true,
@@ -89,13 +94,15 @@ async function collect(
       rapidResults: sections.rapidResults.length,
       nseSymbols: symbols.length,
       mcpOk: mcp.filter((dump) => dump.ok).length,
-      mcpFailed: mcp.filter((dump) => !dump.ok).length,
+      mcpFailed: mcp.filter((dump) => !dump.ok && !dump.pending).length,
+      mcpPending: mcp.filter((dump) => dump.pending).length,
     },
+    truncated: mcp.some((dump) => dump.pending || dump.data?.counts.pending),
     mcp,
   };
 }
 
-async function dumpSymbols(symbols: string[]): Promise<SymbolDump[]> {
+async function dumpSymbols(symbols: string[], deadlineAt: number): Promise<SymbolDump[]> {
   if (symbols.length === 0) return [];
 
   // One probe up front: a dead endpoint is worth reporting once, not as the same
@@ -110,5 +117,16 @@ async function dumpSymbols(symbols: string[]): Promise<SymbolDump[]> {
     }));
   }
 
-  return mapWithConcurrency(symbols, MCP_CONCURRENCY, (symbol) => dumpSymbol(symbol));
+  const dumps = await mapWithConcurrency(symbols, MCP_CONCURRENCY, (symbol) =>
+    dumpSymbol(symbol, { deadlineAt })
+  );
+
+  const pending = dumps.filter((dump) => dump.pending || dump.data?.counts.pending).length;
+  if (pending > 0) {
+    log.warn(
+      `run deadline reached — ${pending} symbol(s) left partial or undumped. ` +
+        `Raise RUN_DEADLINE_MS, or find out why the MCP server is slow.`
+    );
+  }
+  return dumps;
 }

@@ -26,8 +26,8 @@ scraper reads — no headless browser.
 > Previously Python (`scraper.py` + `md_to_json.py` + `mcp_query.js`). The
 > rewrite drops the per-symbol `node` subprocess — the MCP calls are made
 > directly over JSON-RPC — which took a warm full pass from ~3 minutes to under
-> 20 seconds, and it means the n8n Code node no longer needs `python3` installed
-> in the container.
+> 20 seconds, and it means nothing in the n8n container needs `python3` any
+> more, which the Alpine image doesn't ship.
 
 ## ⚠ Testing mode
 
@@ -42,9 +42,14 @@ To go back to production: set `CACHE_ENABLED=1` and use the half-hourly line
 commented at the bottom of `crontab.txt`.
 
 A full pass over ~8 symbols takes about 20 seconds when the MCP server's own
-cache is warm and 1.5–2.5 minutes cold — inside the 5-minute window either way.
-Ticks are serialised regardless: `runOnce` takes a lock file (`.scraper.lock`),
-and an overlapping tick exits immediately with
+cache is warm and 1.5–2.5 minutes cold. It can never run longer than
+`RUN_DEADLINE_MS` (4 minutes): when that is hit, the symbols still queued come
+back as `pending`, the snapshot is marked `"truncated": true`, and the next tick
+picks them up — a partial answer on time beats a run that never ends. Each MCP
+call is separately capped at `MCP_TIMEOUT_MS` (30s).
+
+Ticks are serialised too: `runOnce` takes a lock file (`.scraper.lock`), and an
+overlapping tick exits immediately with
 
 ```json
 {"ok": true, "skipped": true, "reason": "run already in progress"}
@@ -81,6 +86,7 @@ node dist/index.js --section calendar
 node dist/index.js --no-mcp        # skip the MCP step (scrape only)
 node dist/index.js --out data.json # also write the document to a file
 node dist/index.js --quiet         # write data/ but print nothing
+node dist/index.js --cron --print  # print every snapshot in cron mode (quiet by default)
 node dist/index.js --no-lock       # run even if another pass is in flight
 node dist/index.js --help
 ```
@@ -111,7 +117,6 @@ stderr.
 | `src/tools/dump.ts` | runs the catalogue and classifies each answer |
 | `crontab.txt` | the 5-minute schedule for a POSIX host |
 | `run_every.ps1` | the same loop for a Windows host that wants PowerShell to own it |
-| `n8n-workflows/scrape-and-dump.js` | the Code node body, as a readable file |
 | `n8n-workflows/moneycontrol-earnings-scraper.json` | the n8n workflow |
 
 ## The MCP step
@@ -152,7 +157,10 @@ the original text so nothing is lost if the shape changes. `ok: false` marks a
 real tool error; `empty: true` marks a legitimate "no data" answer (no corporate
 actions, not enough price history for a 200-day EMA) — the run is not failed by
 either. A symbol whose every call fails comes back as
-`{"symbol": ..., "ok": false, "error": "..."}` rather than aborting the run.
+`{"symbol": ..., "ok": false, "error": "..."}` rather than aborting the run, and
+one the deadline never reached comes back as
+`{"symbol": ..., "ok": false, "pending": true, ...}` — not a failure, just work
+deferred to the next tick.
 
 ## Output shape
 
@@ -182,7 +190,8 @@ either. A symbol whose every call fails comes back as
   ],
   "nseSymbols": ["DHOOTTRANS", "TECHNOCRAF"],
   "counts": {"resultCalendar": 1, "rapidResults": 9, "nseSymbols": 8,
-             "mcpOk": 8, "mcpFailed": 0},
+             "mcpOk": 8, "mcpFailed": 0, "mcpPending": 0},
+  "truncated": false,
   "mcp": [ ... ],
   "files": {"latest": "...", "run": "...", "history": "...", "symbols": ["..."]}
 }
@@ -241,7 +250,8 @@ name. The ones worth knowing:
 | `RUN_ON_START` | `1` | fire one pass immediately on startup |
 | `CACHE_ENABLED` | `0` | HTTP response cache + on-disk symbol cache |
 | `MCP_CONCURRENCY` | `2` | symbols dumped in parallel |
-| `MCP_TIMEOUT_MS` | `60000` | per MCP call |
+| `MCP_TIMEOUT_MS` | `30000` | per MCP call — short on purpose; 19 calls × N symbols |
+| `RUN_DEADLINE_MS` | `240000` | ceiling on one pass; the rest come back `pending` (0 = no ceiling) |
 | `DATA_DIR` | `./data` | where snapshots are written |
 | `KEEP_RUNS` | `50` | snapshots kept under `data/runs/` (0 = keep all) |
 | `WRITE_DATA_FILES` | `1` | set to `0` for stdout-only runs |
@@ -250,38 +260,89 @@ name. The ones worth knowing:
 
 ## n8n
 
-`n8n-workflows/moneycontrol-earnings-scraper.json` — import it into n8n:
+`n8n-workflows/moneycontrol-earnings-scraper.json` — import it into n8n. It is
+built like `screener-mcp-server`'s supervisor workflow: check the repo out
+inside the container, install, build, then run the CLI.
 
 ```
 Manual Trigger ─┐
-Every 5 minutes ─┼→ Scrape + MCP → Fresh Data? ─┬→ Companies
-Called By Supervisor ─┘                          └→ Skipped Or Failed
+Every 5 minutes ─┼→ Clone + Install + Build → Run Scraper → Parse Scraper JSON → Fresh Data? ─┬→ Split Into Companies
+Called By Supervisor ─┘                                                                        └→ Skipped Or Failed
 ```
 
-* **Scrape + MCP** is a JavaScript Code node holding a self-contained port of
-  `src/` — scrape, resolve, dump, all in-process. Nothing has to be installed in
-  the container: no repo clone, no `npm install`, and **no `python3`**, which is
-  what the old Python node needed and n8n's Alpine image doesn't ship.
-* **Fresh Data?** routes real snapshots to **Companies** (one item per company,
-  carrying its own MCP dump under `mcp`) and everything else — scraper errors,
-  empty pages — to **Skipped Or Failed**.
+* **Clone + Install + Build** — `git fetch --depth 1 origin main` +
+  `reset --hard origin/main` into `/home/node/.n8n/cron_scrapper` (tarball
+  fallback when the image has no `git`), `npm ci --include=dev`, then
+  `./node_modules/.bin/tsc -p tsconfig.json`. The n8n image sets
+  `NODE_ENV=production`, which would skip devDependencies and leave `typescript`
+  missing, so `NODE_ENV=development` is forced for the install. It prints
+  `SYNC_OK <sha>` so you can see which commit is actually running.
 
-Edit the node body in `n8n-workflows/scrape-and-dump.js`, not in the JSON, then:
+  > It is deliberately **not** `git pull --ff-only`: on a shallow clone with no
+  > upstream tracking that dies with `fatal: Cannot fast-forward to multiple
+  > branches`, and behind a trailing `|| true` the failure is silent — the
+  > container then runs a stale checkout indefinitely while still reporting
+  > `BUILD_OK`.
 
-```bash
-npm run n8n:sync            # embed it into the workflow
-npm run n8n:sync -- --check # fail if the workflow is out of date
+* **Run Scraper** — `node dist/index.js --once` with `CACHE_ENABLED=0`,
+  `MCP_ENDPOINT=http://127.0.0.1:3123/mcp` and `RUN_DEADLINE_MS=240000`, wrapped
+  in `timeout -k 10 330`. Between the scraper's own deadline and that hard kill,
+  this node cannot run into the next tick. It never exits non-zero and always
+  prints exactly one document, so the next node always has something to parse.
+  The tail of the log goes to stderr — that is where you look when a pass is
+  slow.
+* **Parse Scraper JSON** — turns the command's `stdout` into JSON and keeps the
+  tail of `stderr` under `log`. Missing output, a failed build or unparseable
+  text all become `{"ok": false, "error": "..."}` rather than an empty item.
+* **Fresh Data?** routes real snapshots to **Split Into Companies** (one item per
+  company, each carrying its own MCP dump under `mcp` and an `mcpStatus` of
+  `done` / `pending` / `failed` / `no-nse-symbol`) and everything else — skipped
+  ticks, build failures, scrape errors, the hard timeout — to **Skipped Or
+  Failed**.
+
+Nothing needs `python3` any more: the n8n image ships Node, which is all this
+build step and the scraper need.
+
+### When a pass takes too long
+
+The **Run Scraper** node's stderr is the log. Each symbol logs its own line
+(`MCP dump CRSL done in 3.4s (ok 17, failed 2, empty 6)`), so a slow pass points
+straight at whichever call is dragging — usually the MCP server itself being
+cold, rate-limited by screener.in, or blocked by NSE from inside the container.
+If you see `run deadline reached — N symbol(s) left partial or undumped`, either
+the endpoint is unhealthy or `RUN_DEADLINE_MS` needs raising along with the
+cadence.
+
+### This repo is private — the build step needs a token
+
+`Tengenisu/cron_scrapper` is private (anonymous requests to both the API and
+codeload get a 404), so a bare `git clone` inside the container fails with
+
+```
+fatal: could not read Username for 'https://github.com': No such device or address
 ```
 
-### The runner's 60-second task timeout
+That is GitHub refusing an anonymous client. **Clone + Install + Build** sets
+`GIT_TERMINAL_PROMPT=0` / `GIT_ASKPASS=/bin/true` so it fails fast with a
+readable message instead of hanging on a prompt, and reads an optional
+`GITHUB_TOKEN`:
 
-n8n kills a Code node task at ~60s. A full pass over every symbol takes longer
-than that when the MCP server is cold, so the node enriches under a
-`DEADLINE_MS` of 40s and **rotates the starting symbol every tick**: each run
-returns inside the limit, and successive runs cover the rest. Symbols not
-reached this tick come back with `mcpStatus: "pending"` instead of being
-dropped. The CLI (`npm run cron`) has no such limit and always does the full
-pass — prefer it when you want complete snapshots.
+```yaml
+# docker-compose.yml
+services:
+  n8n:
+    environment:
+      - GITHUB_TOKEN=ghp_...   # PAT with read access to this repo
+```
+
+The token is passed per command via `http.extraHeader`, so it never lands in
+`.git/config` on the n8n volume, and it is used for the tarball fallback too.
+The node prints `auth: using GITHUB_TOKEN` or `auth: none (repo must be public)`
+so you can see which path it took.
+
+Alternatives: make the repo public, or bind-mount the code at
+`/home/node/.n8n/cron_scrapper` and let the build step's `git pull` fail
+harmlessly.
 
 ### Supervisor integration
 

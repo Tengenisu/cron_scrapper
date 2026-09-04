@@ -105,6 +105,8 @@ export interface McpJobResult {
   ok: boolean;
   error: string | null;
   empty: boolean;
+  /** Never called: the run deadline was reached before this job's turn. */
+  pending?: boolean;
   data?: unknown;
   content?: MarkdownDocument;
   raw: string;
@@ -114,7 +116,7 @@ export interface McpJobResult {
 export interface McpDump {
   symbol: string;
   generatedAt: string;
-  counts: { total: number; ok: number; failed: number; empty: number };
+  counts: { total: number; ok: number; failed: number; empty: number; pending: number };
   jobs: McpJobResult[];
 }
 
@@ -122,6 +124,8 @@ export interface McpDump {
 export interface SymbolDump {
   symbol: string;
   ok: boolean;
+  /** True when the deadline was hit before this symbol could be dumped at all. */
+  pending?: boolean;
   error?: string;
   data?: McpDump;
 }
@@ -148,7 +152,10 @@ export interface EarningsSnapshot {
     nseSymbols: number;
     mcpOk: number;
     mcpFailed: number;
+    mcpPending: number;
   };
+  /** True when the run deadline cut the MCP step short. */
+  truncated: boolean;
   mcp: SymbolDump[];
   files?: WrittenFiles;
 }

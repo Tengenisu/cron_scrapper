@@ -1,8 +1,13 @@
-__pycache__/
-*.pyc
+node_modules/
+dist/
 
-# testing mode writes no cache, but a run still leaves these behind
+# every run regenerates these
+data/
 .scraper.lock
-symbol_cache.json
 out.jsonl
 err.log
+
+# leftovers from the previous Python implementation
+__pycache__/
+*.pyc
+symbol_cache.json

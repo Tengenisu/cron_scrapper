@@ -1,0 +1,30 @@
+{
+  "name": "moneycontrol-earnings-scraper",
+  "version": "2.0.0",
+  "description": "Scrapes Moneycontrol earnings (result calendar + rapid results), resolves each company to its NSE symbol, and dumps every symbol from the screener MCP server on a cron",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "earnings-scraper": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "once": "node dist/index.js --once",
+    "cron": "node dist/index.js --cron",
+    "symbols": "node dist/index.js --once --symbols-only",
+    "dev": "tsc --watch",
+    "n8n:sync": "node n8n-workflows/sync.mjs"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "cheerio": "^1.0.0",
+    "node-cron": "^3.0.3",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/node-cron": "^3.0.11",
+    "typescript": "^5.7.2"
+  }
+}

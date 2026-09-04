@@ -1,5 +1,5 @@
 {
-  "name": "moneycontrol earnings :: scraper (5s, no cache)",
+  "name": "moneycontrol earnings :: scraper (5m, no cache)",
   "nodes": [
     {
       "parameters": {},
@@ -17,21 +17,21 @@
         "rule": {
           "interval": [
             {
-              "field": "seconds",
-              "secondsInterval": 5
+              "field": "minutes",
+              "minutesInterval": 5
             }
           ]
         }
       },
       "id": "b1000000-0000-4000-8000-000000000002",
-      "name": "Every 5 seconds",
+      "name": "Every 5 minutes",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [
         -680,
         160
       ],
-      "notes": "TESTING MODE. A full pass takes minutes; overlapping ticks are dropped by the lock in scraper.py."
+      "notes": "TESTING MODE: every 5 minutes. Run either this trigger or crontab.txt / `npm run cron`, never both, or every symbol gets queried twice."
     },
     {
       "parameters": {},
@@ -44,50 +44,6 @@
         360
       ],
       "notes": "Entry point used by 'screener-mcp :: supervisor' once the MCP server reports healthy."
-    },
-    {
-      "parameters": {
-        "command": "set -e\nDIR=/home/node/.n8n/cron_scrapper\nREPO=https://github.com/Tengenisu/cron_scrapper.git\nTARBALL=https://codeload.github.com/Tengenisu/cron_scrapper/tar.gz/refs/heads/main\n\n# --- fetch or update the repo (git if present, tarball fallback) ---\nif [ -d \"$DIR/.git\" ]; then\n  git -C \"$DIR\" pull --ff-only || true\nelif command -v git >/dev/null 2>&1; then\n  git clone --depth 1 \"$REPO\" \"$DIR\"\nelse\n  echo 'git not found in container, falling back to tarball'\n  mkdir -p \"$DIR\"\n  wget -qO- \"$TARBALL\" | tar xz --strip-components=1 -C \"$DIR\"\nfi\n\ntest -f \"$DIR/scraper.py\" || { echo 'SYNC_FAILED: scraper.py missing'; exit 1; }\n\n# --- the n8n image ships node but NOT python: say so here, loudly ---\n# scraper.py is stdlib-only, so any python3 >= 3.9 will do.\nPY=\"$(command -v python3 || command -v python || true)\"\nif [ -z \"$PY\" ]; then\n  echo 'SYNC_WARN: no python interpreter in this container -- Run Scraper cannot work.'\n  echo '  fix with:  docker exec -u root <n8n-container> apk add --no-cache python3'\n  echo '  or bake python3 into a custom n8n image, or run scraper.py on the host.'\nelse\n  echo \"python=$(\"$PY\" -V 2>&1) at $PY\"\nfi\n\necho \"SYNC_OK dir=$DIR node=$(node -v)\"\n"
-      },
-      "id": "b1000000-0000-4000-8000-000000000004",
-      "name": "Sync Scraper Repo",
-      "type": "n8n-nodes-base.executeCommand",
-      "typeVersion": 1,
-      "position": [
-        -420,
-        160
-      ],
-      "alwaysOutputData": true,
-      "notes": "Idempotent clone/pull, mirroring the supervisor's build step. Also checks for a python interpreter -- the n8n image ships node but not python3."
-    },
-    {
-      "parameters": {
-        "command": "DIR=/home/node/.n8n/cron_scrapper\ncd \"$DIR\"\n\n# The n8n image has no python by default. Fail as one parseable JSON document\n# rather than as an empty stdout the parser cannot explain.\nPY=\"$(command -v python3 || command -v python || true)\"\nif [ -z \"$PY\" ]; then\n  echo '{\"ok\":false,\"error\":\"no python interpreter in the n8n container -- see the Sync Scraper Repo output\"}'\n  exit 0\nfi\n\n# TESTING MODE: caching is off, so every run re-resolves symbols and re-queries\n# the MCP server. A tick that overlaps a run in flight exits with skipped:true.\nCACHE_ENABLED=0 \\\nMCP_ENDPOINT=http://127.0.0.1:3123/mcp \\\nLOG_LEVEL=INFO \\\n\"$PY\" scraper.py\n"
-      },
-      "id": "b1000000-0000-4000-8000-000000000005",
-      "name": "Run Scraper",
-      "type": "n8n-nodes-base.executeCommand",
-      "typeVersion": 1,
-      "position": [
-        -180,
-        160
-      ],
-      "alwaysOutputData": true,
-      "onError": "continueRegularOutput",
-      "notes": "scraper.py always prints one JSON document on stdout, including on failure and when python is missing."
-    },
-    {
-      "parameters": {
-        "jsCode": "// scraper.py prints exactly one JSON document on stdout -- success, failure or\n// skipped tick. Anything else means the command itself broke.\nconst out = [];\n\nfor (const item of $input.all()) {\n  const stdout = (item.json.stdout || '').trim();\n  const stderr = (item.json.stderr || '').trim();\n\n  let parsed;\n  try {\n    parsed = JSON.parse(stdout.slice(stdout.indexOf('{')));\n  } catch (e) {\n    out.push({ json: { ok: false, skipped: false, error: 'unparseable scraper output: ' + e.message, stdout: stdout.slice(0, 2000), stderrTail: stderr.slice(-2000) } });\n    continue;\n  }\n\n  parsed.skipped = parsed.skipped === true;\n  parsed.stderrTail = stderr.slice(-2000);\n  out.push({ json: parsed });\n}\n\nreturn out;"
-      },
-      "id": "b1000000-0000-4000-8000-000000000006",
-      "name": "Parse Scraper JSON",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        60,
-        160
-      ]
     },
     {
       "parameters": {
@@ -120,21 +76,8 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        300,
+        -100,
         160
-      ]
-    },
-    {
-      "parameters": {
-        "jsCode": "// One item per company, each carrying its own MCP dump. No dedup by design:\n// every run emits the full current snapshot so downstream nodes can diff.\nconst out = [];\n\nfor (const item of $input.all()) {\n  const d = item.json;\n  const bySymbol = Object.fromEntries((d.mcp || []).map(m => [m.symbol, m]));\n\n  const rows = [\n    ...(d.resultCalendar || []).map(r => ({ ...r, section: 'resultCalendar' })),\n    ...(d.rapidResults || []).map(r => ({ ...r, section: 'rapidResults' })),\n  ];\n\n  for (const row of rows) {\n    const mcp = row.nseSymbol ? bySymbol[row.nseSymbol] : undefined;\n    out.push({\n      json: {\n        scrapedAt: d.scrapedAt,\n        calendarDate: d.calendarDate,\n        cacheEnabled: d.cacheEnabled,\n        section: row.section,\n        company: row.company,\n        scId: row.scId,\n        nseSymbol: row.nseSymbol || null,\n        exchange: row.exchange,\n        ltp: row.ltp,\n        changePercent: row.changePercent,\n        resultType: row.resultType || row.period || null,\n        record: row,\n        mcpOk: mcp ? mcp.ok : null,\n        mcpCounts: mcp && mcp.data ? mcp.data.counts : null,\n        mcp: mcp || null,\n      },\n    });\n  }\n}\n\nreturn out;"
-      },
-      "id": "b1000000-0000-4000-8000-000000000008",
-      "name": "Split Into Companies",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        560,
-        40
       ]
     },
     {
@@ -152,12 +95,6 @@
               "name": "reason",
               "value": "={{ $json.reason || $json.error || 'unknown' }}",
               "type": "string"
-            },
-            {
-              "id": "e1000000-0000-4000-8000-000000000003",
-              "name": "stderrTail",
-              "value": "={{ $json.stderrTail || '' }}",
-              "type": "string"
             }
           ]
         },
@@ -168,10 +105,39 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        560,
+        160,
         300
       ],
-      "notes": "A skipped tick is normal at a 5-second cadence: the previous pass is still running."
+      "notes": "Scrape failed, or the page listed no companies at all."
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * The body of the \"Scrape + MCP\" Code node in\n * moneycontrol-earnings-scraper.json — kept here as a real file so it can be\n * read, diffed and linted, and embedded into the workflow with:\n *\n *     npm run n8n:sync\n *\n * n8n Code node, language: JavaScript, mode: Run Once for All Items.\n *\n * It is a self-contained port of src/ (scrape → resolve NSE symbols → MCP dump)\n * so the workflow needs nothing installed in the container: no repo clone, no\n * npm install, no python — n8n's image ships Node, which is the whole reason\n * this repo moved off Python.\n *\n * The task runner kills a task at ~60s while a full pass over every symbol takes\n * longer, so enrichment runs under DEADLINE_MS and the starting symbol rotates\n * every tick: each run returns inside the limit and successive runs cover the\n * rest. Symbols not reached this tick come back with mcpStatus \"pending\" rather\n * than being dropped.\n */\n\nconst EARNINGS_URL = \"https://www.moneycontrol.com/markets/earnings/\";\nconst PRICE_FEED_URL = \"https://priceapi.moneycontrol.com/pricefeed/{exchange}/equitycash/{scId}\";\nconst MCP_ENDPOINT = \"http://127.0.0.1:3123/mcp\";\n\nconst HTTP_TIMEOUT_MS = 20000;\nconst HTTP_RETRIES = 2;\nconst USER_AGENT =\n  \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\";\n\n// Stay well under the runner's ~60s task timeout: an in-flight HTTP call cannot\n// be interrupted, so leave room for one to overshoot the deadline.\nconst DEADLINE_MS = 40000;\nconst CONSOLIDATED = true;\nconst LIST_LIMIT = 10;\n\nconst STARTED = Date.now();\nconst remaining = () => DEADLINE_MS - (Date.now() - STARTED);\n\nconst NEXT_DATA_OPEN = '<script id=\"__NEXT_DATA__\" type=\"application/json\">';\nconst EXCHANGE_SEGMENT = { N: \"nse\", B: \"bse\" };\n\nconst helpers = this.helpers;\n\n// --------------------------------------------------------------------------- //\n// HTTP\n// --------------------------------------------------------------------------- //\n\n/** GET/POST returning text. Uses global fetch where the runner exposes it. */\nasync function httpText(url, options = {}) {\n  const { method = \"GET\", body = null, headers = {} } = options;\n  const allHeaders = {\n    \"User-Agent\": USER_AGENT,\n    \"Accept-Language\": \"en-US,en;q=0.9\",\n    // nothing is cached: every run must regenerate its data\n    \"Cache-Control\": \"no-cache, no-store, max-age=0\",\n    Pragma: \"no-cache\",\n    ...headers,\n  };\n\n  let lastError = null;\n  for (let attempt = 0; attempt < HTTP_RETRIES; attempt++) {\n    try {\n      if (typeof fetch === \"function\") {\n        const controller = new AbortController();\n        const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);\n        try {\n          const response = await fetch(url, {\n            method,\n            headers: allHeaders,\n            body,\n            signal: controller.signal,\n          });\n          const text = await response.text();\n          if (!response.ok) throw new Error(\"HTTP \" + response.status);\n          return text;\n        } finally {\n          clearTimeout(timer);\n        }\n      }\n      return await helpers.httpRequest({\n        url,\n        method,\n        headers: allHeaders,\n        body,\n        json: false,\n        timeout: HTTP_TIMEOUT_MS,\n      });\n    } catch (err) {\n      lastError = err;\n      if (attempt + 1 < HTTP_RETRIES && remaining() > 5000) {\n        await new Promise((resolve) => setTimeout(resolve, 1000));\n      } else {\n        break;\n      }\n    }\n  }\n  throw new Error(url + \" -> \" + (lastError && lastError.message ? lastError.message : lastError));\n}\n\nconst cacheBust = (url) => url + (url.includes(\"?\") ? \"&\" : \"?\") + \"_=\" + Date.now();\n\n// --------------------------------------------------------------------------- //\n// Moneycontrol page\n// --------------------------------------------------------------------------- //\n\nasync function fetchEarnings() {\n  const html = await httpText(cacheBust(EARNINGS_URL), { headers: { Accept: \"text/html,*/*;q=0.8\" } });\n  const start = html.indexOf(NEXT_DATA_OPEN);\n  if (start === -1) throw new Error(\"__NEXT_DATA__ not found — page changed or request blocked\");\n  const from = start + NEXT_DATA_OPEN.length;\n  const end = html.indexOf(\"</script>\", from);\n  if (end === -1) throw new Error(\"__NEXT_DATA__ script tag is not terminated\");\n  const blob = JSON.parse(html.slice(from, end));\n  const dashboard = blob && blob.props && blob.props.pageProps && blob.props.pageProps.earningsDashboardData;\n  if (!dashboard) throw new Error(\"earningsDashboardData missing from __NEXT_DATA__\");\n  return dashboard;\n}\n\nfunction num(value) {\n  if (value === null || value === undefined) return null;\n  const text = String(value).trim();\n  if (text === \"\" || text === \"-\" || text === \"--\") return null;\n  const parsed = Number(text.replace(/,/g, \"\"));\n  return Number.isFinite(parsed) ? parsed : null;\n}\n\nfunction parseResultCalendar(dashboard) {\n  const rows = (dashboard.resCalData && dashboard.resCalData.list) || [];\n  return rows.map((row) => ({\n    section: \"resultCalendar\",\n    date: row.date ?? null,\n    company: row.stockName ?? null,\n    shortName: row.stockShortName ?? null,\n    scId: row.scId ?? null,\n    exchange: row.exchange ?? null,\n    resultType: row.resultType ?? null,\n    ltp: num(row.ltp),\n    changePercent: num(row.change),\n    time: row.time ?? null,\n    marketCap: num(row.marketCap),\n    url: row.stockUrl ?? null,\n  }));\n}\n\nfunction parseRapidResults(dashboard) {\n  const block = dashboard.rapResData || {};\n  const baseUrl = block.baseURL || \"\";\n  const names = (block.header || []).map((h) => h.name || \"\");\n  const columns = block.tableHeader || [];\n\n  return (block.list || []).map((row) => {\n    const record = {};\n    names.forEach((name, index) => {\n      if (name) record[name] = row[index];\n    });\n\n    const quarterData = (Array.isArray(record.quarterData) ? record.quarterData : []).map((metric) => {\n      const cells = Array.isArray(metric) ? metric : [];\n      return {\n        metric: cells[0] ?? null,\n        current: num(cells[1]),\n        previous: num(cells[2]),\n        growthPercent: num(cells[3]),\n      };\n    });\n\n    const seo = record.seoString || \"\";\n    return {\n      section: \"rapidResults\",\n      date: record.date ?? null,\n      company: record.stockName ?? null,\n      scId: record.scID ?? record.scId ?? null,\n      exchange: record.exchange ?? null,\n      ltp: num(record.ltp),\n      changePercent: num(record.changeP),\n      financialType: record.financialType ?? null,\n      resultType: columns[0] ?? null,\n      columns,\n      quarterData,\n      url: seo ? baseUrl + seo : null,\n    };\n  });\n}\n\n/** scId -> NSE symbol. Never cached: looked up live on every run. */\nasync function resolveSymbol(scId, exchange) {\n  if (!scId) return null;\n  const primary = EXCHANGE_SEGMENT[String(exchange || \"N\").toUpperCase()] || \"nse\";\n  const segments = primary === \"nse\" ? [\"nse\"] : [primary, \"nse\"];\n\n  for (const segment of segments) {\n    try {\n      const url = PRICE_FEED_URL.replace(\"{exchange}\", segment).replace(\"{scId}\", scId);\n      const payload = JSON.parse(await httpText(url, { headers: { Accept: \"application/json\" } }));\n      const candidate = String((payload && payload.data && payload.data.NSEID) || \"\").trim();\n      if (candidate && candidate !== \"-\" && candidate !== \"--\") return candidate;\n    } catch (err) {\n      // try the next segment; a missing mapping is normal for BSE-only scrips\n    }\n  }\n  return null;\n}\n\n// --------------------------------------------------------------------------- //\n// Markdown -> JSON (the parts of src/services/markdown.ts the MCP output uses)\n// --------------------------------------------------------------------------- //\n\nconst HEADING = /^(#{1,6})\\s+(.*\\S)\\s*$/;\nconst KEYVAL = /^\\s*\\*{0,2}([A-Za-z0-9][^:*]{0,60}?)\\*{0,2}\\s*:\\s+(.*\\S)\\s*$/;\nconst TABLE_SEP = /^\\s*\\|?\\s*:?-{2,}:?\\s*(\\|\\s*:?-{2,}:?\\s*)*\\|?\\s*$/;\nconst BULLET = /^\\s*[-*+]\\s+(.*)$/;\nconst NULLS = new Set([\"\", \"-\", \"--\", \"—\", \"–\", \"N/A\", \"NA\", \"null\", \"None\"]);\n\nfunction coerce(value) {\n  const trimmed = String(value).trim();\n  if (NULLS.has(trimmed)) return null;\n  const lower = trimmed.toLowerCase();\n  if (lower === \"true\" || lower === \"false\") return lower === \"true\";\n  const cleaned = trimmed.replace(/,/g, \"\").replace(/%/g, \"\").replace(/₹/g, \"\").trim();\n  if (/^[+-]?\\d+$/.test(cleaned)) return Number.parseInt(cleaned, 10);\n  if (/^[+-]?\\d*\\.\\d+$/.test(cleaned)) return Number.parseFloat(cleaned);\n  return trimmed;\n}\n\nconst splitRow = (line) =>\n  line\n    .trim()\n    .replace(/^\\|/, \"\")\n    .replace(/\\|$/, \"\")\n    .split(\"|\")\n    .map((cell) => cell.trim());\n\nfunction markdownToObject(markdown) {\n  const lines = String(markdown == null ? \"\" : markdown).replace(/\\r\\n/g, \"\\n\").split(\"\\n\");\n  const fields = {};\n  const tables = [];\n  const items = [];\n  const text = [];\n\n  let i = 0;\n  while (i < lines.length) {\n    const line = lines[i];\n\n    if (line.trim().startsWith(\"|\") && TABLE_SEP.test(lines[i + 1] || \"\")) {\n      const headers = splitRow(line);\n      i += 2;\n      const rows = [];\n      while (i < lines.length && lines[i].trim().startsWith(\"|\")) {\n        const cells = splitRow(lines[i]);\n        const row = {};\n        headers.forEach((header, n) => {\n          row[header || \"col\" + n] = coerce(cells[n] ?? \"\");\n        });\n        rows.push(row);\n        i++;\n      }\n      tables.push(rows);\n      continue;\n    }\n\n    if (HEADING.test(line)) {\n      i++;\n      continue;\n    }\n\n    const bullet = BULLET.exec(line);\n    const candidate = bullet ? bullet[1] : line;\n    const keyval = KEYVAL.exec(candidate);\n    if (keyval) fields[keyval[1].trim()] = coerce(keyval[2]);\n    else if (bullet) items.push(candidate.trim());\n    else if (line.trim()) text.push(line.replace(/\\s+$/, \"\"));\n    i++;\n  }\n\n  return { fields, tables, items, text: text.join(\"\\n\").trim() };\n}\n\n// --------------------------------------------------------------------------- //\n// MCP — the src/tools/catalog.ts job list, called straight over JSON-RPC\n// --------------------------------------------------------------------------- //\n\nconst STATEMENTS = [\"quarters\", \"profit-loss\", \"balance-sheet\", \"cash-flow\", \"ratios\"];\nconst INDICATORS = [\n  [\"RSI\", 14],\n  [\"SMA\", 50],\n  [\"EMA\", 200],\n  [\"MACD\", 0],\n];\nconst FAILURE_PREFIXES = [\"REQUEST FAILED:\", \"RPC ERROR:\", \"Error:\"];\nconst EMPTY_MARKERS = [\n  \"No corporate actions found\",\n  \"No recent announcements found\",\n  \"Not enough price history\",\n  \"No data\",\n  \"_No rows returned._\",\n];\n\nfunction jobsFor(symbol) {\n  return [\n    [\"SEARCH MATCH\", \"screener_search_companies\", { query: symbol }],\n    [\"COMPANY OVERVIEW\", \"screener_get_company_overview\", { identifier: symbol, consolidated: CONSOLIDATED }],\n    ...STATEMENTS.map((statement) => [\n      statement.toUpperCase(),\n      \"screener_get_financial_statement\",\n      { identifier: symbol, statement: statement, consolidated: CONSOLIDATED },\n    ]),\n    [\"PEER COMPARISON\", \"screener_get_peer_comparison\", { identifier: symbol, consolidated: CONSOLIDATED }],\n    [\"NSE LIVE QUOTE\", \"nse_get_quote\", { symbol: symbol }],\n    [\"NSE ANNOUNCEMENTS\", \"nse_get_announcements\", { symbol: symbol, limit: LIST_LIMIT }],\n    [\"NSE CORP ACTIONS\", \"nse_get_corporate_actions\", { symbol: symbol, limit: LIST_LIMIT }],\n    ...[\"NSE\", \"BSE\"].flatMap((exchange) =>\n      INDICATORS.map(([indicator, period]) => [\n        indicator + (period ? \" \" + period : \"\") + \" daily [\" + exchange + \"]\",\n        \"technical_get_indicator\",\n        Object.assign(\n          { ticker: symbol, exchange: exchange, indicator: indicator, interval: \"daily\", limit: 5 },\n          period ? { time_period: period } : {}\n        ),\n      ])\n    ),\n  ];\n}\n\n/** One tools/call. Handles both plain JSON and SSE (data:) replies. */\nasync function mcpCall(tool, args, id) {\n  let raw;\n  try {\n    raw = await httpText(MCP_ENDPOINT, {\n      method: \"POST\",\n      headers: { \"Content-Type\": \"application/json\", Accept: \"application/json, text/event-stream\" },\n      body: JSON.stringify({ jsonrpc: \"2.0\", id: id, method: \"tools/call\", params: { name: tool, arguments: args } }),\n    });\n  } catch (err) {\n    return \"REQUEST FAILED: \" + err.message;\n  }\n\n  let text = raw.trim();\n  if (!text.startsWith(\"{\")) {\n    const dataLines = text.split(\"\\n\").filter((line) => line.startsWith(\"data:\"));\n    if (dataLines.length === 0) return \"REQUEST FAILED: unparseable response: \" + text.slice(0, 200);\n    text = dataLines[dataLines.length - 1].slice(5).trim();\n  }\n\n  let payload;\n  try {\n    payload = JSON.parse(text);\n  } catch (err) {\n    return \"REQUEST FAILED: \" + err.message;\n  }\n\n  if (payload.error) return \"RPC ERROR: \" + JSON.stringify(payload.error);\n  const content = payload.result && payload.result.content;\n  if (!Array.isArray(content)) return JSON.stringify(payload.result || payload, null, 2);\n  return content.map((part) => part.text || JSON.stringify(part)).join(\"\\n\");\n}\n\nfunction classify(body) {\n  const head = body.trimStart();\n  for (const prefix of FAILURE_PREFIXES) {\n    if (head.startsWith(prefix)) return { ok: false, error: head.split(\"\\n\")[0].trim(), empty: false };\n  }\n  if (EMPTY_MARKERS.some((marker) => head.startsWith(marker))) return { ok: true, error: null, empty: true };\n  return { ok: true, error: null, empty: head.length === 0 };\n}\n\n/** The 19-call full dump for one symbol, as structured JSON. */\nasync function mcpDump(symbol, baseId) {\n  const jobs = [];\n  const specs = jobsFor(symbol);\n\n  for (let offset = 0; offset < specs.length; offset++) {\n    const [label, tool, args] = specs[offset];\n\n    if (remaining() <= 3000) {\n      jobs.push({ label: label, tool: tool, ok: true, error: null, empty: true, pending: true });\n      continue;\n    }\n\n    const body = await mcpCall(tool, args, baseId + offset);\n    const verdict = classify(body);\n    const job = {\n      label: label,\n      tool: tool,\n      ok: verdict.ok,\n      error: verdict.error,\n      empty: verdict.empty,\n      pending: false,\n    };\n\n    if (verdict.ok && !verdict.empty) {\n      const head = body.trimStart();\n      if (head.startsWith(\"{\") || head.startsWith(\"[\")) {\n        try {\n          job.data = JSON.parse(head);\n        } catch (err) {\n          job.content = markdownToObject(body);\n        }\n      } else {\n        job.content = markdownToObject(body);\n      }\n    }\n    job.raw = body;\n    jobs.push(job);\n  }\n\n  return {\n    symbol: symbol,\n    generatedAt: new Date().toISOString(),\n    jobs: jobs,\n    counts: {\n      total: jobs.length,\n      ok: jobs.filter((j) => j.ok && !j.pending).length,\n      failed: jobs.filter((j) => !j.ok).length,\n      empty: jobs.filter((j) => j.empty && !j.pending).length,\n      pending: jobs.filter((j) => j.pending).length,\n    },\n  };\n}\n\n// --------------------------------------------------------------------------- //\n// Main — one output item per company\n// --------------------------------------------------------------------------- //\n\nconst scrapedAt = new Date().toISOString();\n\nlet dashboard;\ntry {\n  dashboard = await fetchEarnings();\n} catch (err) {\n  return [{ json: { ok: false, skipped: false, scrapedAt: scrapedAt, error: \"scrape failed: \" + err.message } }];\n}\n\nconst records = [...parseResultCalendar(dashboard), ...parseRapidResults(dashboard)];\nfor (const record of records) {\n  record.nseSymbol = await resolveSymbol(record.scId, record.exchange || \"N\");\n}\n\nconst symbols = [...new Set(records.map((r) => r.nseSymbol).filter(Boolean))].sort();\n\n// Rotate the starting symbol so consecutive ticks cover different ones instead\n// of always enriching the same head of the list.\nconst dumps = {};\nif (symbols.length > 0) {\n  const start = Math.floor(Date.now() / DEADLINE_MS) % symbols.length;\n  const order = [...symbols.slice(start), ...symbols.slice(0, start)];\n  for (let n = 0; n < order.length; n++) {\n    if (remaining() <= 5000) break;\n    dumps[order[n]] = await mcpDump(order[n], 1000 * (n + 1));\n  }\n}\n\nconst out = records.map((record) => {\n  const symbol = record.nseSymbol;\n  const dump = dumps[symbol];\n  const mcpStatus = !symbol ? \"no-nse-symbol\" : dump ? \"done\" : \"pending\";\n\n  return {\n    json: {\n      ok: true,\n      skipped: false,\n      scrapedAt: scrapedAt,\n      calendarDate: dashboard.resCalTodayDate ?? null,\n      cacheEnabled: false,\n      section: record.section,\n      company: record.company,\n      scId: record.scId,\n      nseSymbol: symbol,\n      exchange: record.exchange,\n      ltp: record.ltp,\n      changePercent: record.changePercent,\n      resultType: record.resultType,\n      record: record,\n      mcpStatus: mcpStatus,\n      mcpCounts: dump ? dump.counts : null,\n      mcp: dump || null,\n      elapsedSeconds: Math.round((Date.now() - STARTED) / 100) / 10,\n      symbolsTotal: symbols.length,\n      symbolsEnriched: Object.keys(dumps).length,\n    },\n  };\n});\n\nreturn out.length > 0\n  ? out\n  : [{ json: { ok: true, skipped: true, scrapedAt: scrapedAt, reason: \"no companies listed on the page right now\" } }];\n"
+      },
+      "id": "b1000000-0000-4000-8000-00000000000a",
+      "name": "Scrape + MCP",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -360,
+        160
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "Scrapes Moneycontrol, resolves NSE symbols and runs the 19-call MCP dump per symbol, all in-process. The body is n8n-workflows/scrape-and-dump.js — edit that file and run `npm run n8n:sync`, don't edit it here. JavaScript, so nothing has to be installed in the n8n container. Enrichment stops at DEADLINE_MS=40000 to stay under the ~60s task timeout, and the starting symbol rotates each tick so successive runs cover the rest.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "b1000000-0000-4000-8000-00000000000b",
+      "name": "Companies",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        160,
+        40
+      ],
+      "notes": "One item per company, each carrying its own MCP dump under `mcp`."
     }
   ],
   "connections": {
@@ -179,18 +145,7 @@
       "main": [
         [
           {
-            "node": "Sync Scraper Repo",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Every 5 seconds": {
-      "main": [
-        [
-          {
-            "node": "Sync Scraper Repo",
+            "node": "Scrape + MCP",
             "type": "main",
             "index": 0
           }
@@ -201,40 +156,7 @@
       "main": [
         [
           {
-            "node": "Sync Scraper Repo",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Sync Scraper Repo": {
-      "main": [
-        [
-          {
-            "node": "Run Scraper",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Run Scraper": {
-      "main": [
-        [
-          {
-            "node": "Parse Scraper JSON",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Parse Scraper JSON": {
-      "main": [
-        [
-          {
-            "node": "Fresh Data?",
+            "node": "Scrape + MCP",
             "type": "main",
             "index": 0
           }
@@ -245,7 +167,7 @@
       "main": [
         [
           {
-            "node": "Split Into Companies",
+            "node": "Companies",
             "type": "main",
             "index": 0
           }
@@ -253,6 +175,28 @@
         [
           {
             "node": "Skipped Or Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 5 minutes": {
+      "main": [
+        [
+          {
+            "node": "Scrape + MCP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scrape + MCP": {
+      "main": [
+        [
+          {
+            "node": "Fresh Data?",
             "type": "main",
             "index": 0
           }

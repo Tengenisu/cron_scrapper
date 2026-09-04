@@ -1,30 +1,39 @@
 # Moneycontrol earnings scraper schedule.
 #
-# TESTING MODE: every 5 seconds, around the clock, with caching disabled so
+# TESTING MODE: every 5 minutes, around the clock, with caching disabled so
 # every tick regenerates its data from scratch.
 #
-# cron cannot express sub-minute schedules, so cron fires run_every.sh once a
-# minute and that script loops through the minute at a 5-second cadence. A tick
-# that lands while the previous pass is still running (a full pass over ~8
-# symbols takes a couple of minutes) is dropped by the lock in scraper.py and
-# prints {"ok": true, "skipped": true}, so nothing stacks up.
+# Two ways to run this — pick ONE, or every symbol gets queried twice:
 #
-# Install with:  crontab crontab.txt      (check with: crontab -l)
+#   1. This crontab (POSIX hosts). Install with:  crontab crontab.txt
+#      Check with:                                crontab -l
+#   2. The in-process scheduler:  npm run cron
+#      Same cadence, same code path, and it works on Windows where there is no
+#      crond. That is what render.yaml and the Docker/Windows notes in the
+#      README use.
+#
+# A pass over ~8 symbols takes a couple of minutes, which is close enough to a
+# 5-minute cadence that ticks can overlap. A tick that lands while the previous
+# pass is still running is dropped by the lock file and prints
+# {"ok": true, "skipped": true}, so nothing stacks up.
 
 CRON_TZ=Asia/Kolkata
 SHELL=/bin/bash
 PATH=/usr/local/bin:/usr/bin:/bin
 
-RUN_INTERVAL_SECONDS=5
 CACHE_ENABLED=0
+MCP_ENDPOINT=http://127.0.0.1:3123/mcp
 
-* * * * *  cd /opt/cron_scrapper && ./run_every.sh >> /var/log/earnings/cron.log 2>&1
+# min hour dom mon dow   command
+*/5 * * * *  cd /opt/cron_scrapper && node dist/index.js --once --quiet >> /var/log/earnings/cron.log 2>&1
 
-# To go back to market-hours-only scanning, drop the line above and use:
-#   0,30 9-23 * * *  cd /opt/cron_scrapper && /usr/bin/python3 scraper.py >> /var/log/earnings/out.jsonl 2>> /var/log/earnings/err.log
-#   0,30 0    * * *  cd /opt/cron_scrapper && /usr/bin/python3 scraper.py >> /var/log/earnings/out.jsonl 2>> /var/log/earnings/err.log
-#   0    1    * * *  cd /opt/cron_scrapper && /usr/bin/python3 scraper.py >> /var/log/earnings/out.jsonl 2>> /var/log/earnings/err.log
+# Keep the JSON documents as a stream instead of only data/latest.json:
+#   */5 * * * *  cd /opt/cron_scrapper && node dist/index.js --once >> /var/log/earnings/out.jsonl 2>> /var/log/earnings/err.log
+#
+# Back to production cadence (half-hourly, caching on):
+#   CACHE_ENABLED=1
+#   0,30 * * * *  cd /opt/cron_scrapper && node dist/index.js --once --quiet >> /var/log/earnings/cron.log 2>&1
 #
 # If n8n owns the schedule instead, use the Schedule Trigger in
-# n8n-workflows/moneycontrol-earnings-scraper.json (also 5 seconds) and do not
-# install this crontab, or every symbol gets queried twice.
+# n8n-workflows/moneycontrol-earnings-scraper.json (also every 5 minutes) and do
+# not install this crontab.

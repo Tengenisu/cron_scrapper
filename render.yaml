@@ -1,0 +1,20 @@
+services:
+  - type: worker
+    name: moneycontrol-earnings-scraper
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm run cron
+    envVars:
+      - key: NODE_VERSION
+        value: 20.11.0
+      # TESTING MODE: every 5 minutes, nothing cached.
+      - key: CRON_SCHEDULE
+        value: "*/5 * * * *"
+      - key: CRON_TIMEZONE
+        value: Asia/Kolkata
+      - key: CACHE_ENABLED
+        value: "0"
+      # Point this at wherever screener-mcp-server is reachable from the worker.
+      - key: MCP_ENDPOINT
+        value: http://127.0.0.1:3123/mcp

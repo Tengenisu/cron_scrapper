@@ -1,0 +1,18 @@
+# Moneycontrol earnings scraper schedule (IST).
+# Every 30 minutes from 09:00 to 15:30, and again from 15:30 through 01:00 next day.
+# Install with:  crontab crontab.txt      (check with: crontab -l)
+
+CRON_TZ=Asia/Kolkata
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# 09:00 -> 23:30
+0,30 9-23 * * *  cd /opt/cron_scrapper && /usr/bin/python3 scraper.py >> /var/log/earnings/out.jsonl 2>> /var/log/earnings/err.log
+
+# 00:00, 00:30 and the final 01:00 run
+0,30 0 * * *     cd /opt/cron_scrapper && /usr/bin/python3 scraper.py >> /var/log/earnings/out.jsonl 2>> /var/log/earnings/err.log
+0 1 * * *        cd /opt/cron_scrapper && /usr/bin/python3 scraper.py >> /var/log/earnings/out.jsonl 2>> /var/log/earnings/err.log
+
+# If n8n itself owns the schedule, use its Schedule Trigger with the same cron
+# expressions and an Execute Command node running `python3 scraper.py` instead;
+# do not run both, or every symbol gets queried twice.

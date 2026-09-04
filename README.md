@@ -140,7 +140,8 @@ stderr.
 | `src/tools/format.ts` | a raw dump → the document that ships |
 | `crontab.txt` | the 5-minute schedule for a POSIX host |
 | `run_every.ps1` | the same loop for a Windows host that wants PowerShell to own it |
-| `n8n-workflows/moneycontrol-earnings-scraper.json` | the n8n workflow |
+| `n8n-workflows/moneycontrol-earnings-scraper.json` | the n8n workflow for this scraper |
+| `n8n-workflows/univest-upcoming-results.json` | a separate pipeline: Univest API -> MCP -> "Sep 2026" filter |
 
 ## The MCP step
 
@@ -351,6 +352,15 @@ name. The ones worth knowing:
 built like `screener-mcp-server`'s supervisor workflow: check the repo out
 inside the container, install, build, then run the CLI.
 
+> **A workflow is a manual import.** The Clone/Build node pulls the *scraper
+> source* from git, so code changes reach the container on the next tick — but
+> the workflow itself lives in n8n's own database and nothing updates it.
+> Editing the JSON in this repo changes a file the container never reads, so
+> **re-import after every change**. The failure mode is quiet: a stale Split
+> node reading fields the new snapshot no longer has produces
+> `{"ok":true,"skipped":true,"reason":"no companies listed on the page right now"}`,
+> which looks exactly like a scrape that found nothing.
+
 ```
 Manual Trigger ─┐
 Every 5 minutes ─┼→ Clone + Install + Build → Run Scraper → Parse Scraper JSON → Fresh Data? ─┬→ Split Into Companies
@@ -452,6 +462,162 @@ the supervisor's health loop.
 After importing both workflows, open that node and set **Workflow** to the
 imported scraper workflow (its `workflowId` currently reads
 `REPLACE_WITH_MONEYCONTROL_SCRAPER_WORKFLOW_ID`).
+
+## The Univest workflow
+
+`n8n-workflows/univest-upcoming-results.json` — a second, independent pipeline.
+It does not use this repo's scraper at all: the stock list comes from Univest's
+own API instead of from Moneycontrol, and the only thing it asks the MCP server
+for is the quarterly results table.
+
+```
+Manual Trigger ─┐
+Every 5 minutes ─┼→ Build MCP Server → Start If Not Running → Wait 5s → Health Check → Healthy?
+Called By Supervisor ─┘                                                                    │
+   ┌───────────────────────────────────────────── true ─────────────────────────────────────┘
+   ↓
+Fetch Upcoming Results → Flatten → Query Screener MCP → Filter On Sep 2026 Column
+                                                                    ↓
+                                                    Write Run Log → Return Qualified Data
+
+   └── false → Dump MCP Log → Build Health Failure → Write Health Failure → MCP Unhealthy
+```
+
+The MCP half — build, start, wait, `tools/list` probe — is lifted verbatim from
+the supervisor workflow, so nothing downstream can ever query a dead endpoint.
+
+* **Fetch Upcoming Results** — `GET api.univest.in/resources/stock-details/upcoming-results`
+  with a bearer token. It answers stocks grouped by result date:
+
+  ```json
+  {"data": {"2026-09-07": [{"finCode": 303646, "compName": "Kotyark Industries Ltd.",
+                            "nseSymbol": "KOTYARK-BE", "bseSymbol": "KOTYARK", ...}]}}
+  ```
+
+  `fullResponse` is on, so a non-200 is logged with its body rather than
+  aborting the run.
+
+* **Flatten Upcoming Results** — date buckets to one item per stock, and this is
+  where the **series suffix comes off**. The API returns the NSE *trading*
+  symbol, which carries the series: `DHTL-SM` (SME board), `KOTYARK-BE` (book
+  entry), also `-BZ` / `-BL` / `-ST`. screener.in only knows the bare ticker —
+  `/company/DHTL-SM/` is a 404 and `/company/DHTL/` is not — so every one of
+  those stocks would silently fail without the strip. A symbol that will not
+  reduce to `^[A-Za-z0-9][A-Za-z0-9&.-]*$` is marked `usable: false` and never
+  reaches the shell.
+
+* **Query Screener MCP** — one `node -e` per stock, posting a single
+  `tools/call` for `screener_get_financial_statement` (`quarters`). It falls
+  back from consolidated to standalone when consolidated is missing or empty,
+  never exits non-zero, and always prints exactly one JSON document.
+
+  > The script is inlined into `node -e '...'`, so it deliberately contains **no
+  > single quote anywhere** — double quotes and backticks only. The generator
+  > refuses to build if one creeps in. Keep that rule when editing it.
+
+* **Filter On Sep 2026 Column** — the parser and the filter. See below.
+
+* **Write Run Log** — one shell run per execution (not per stock) appending the
+  three log files.
+
+* **Return Qualified Data** — one item per qualifying stock. When nothing
+  qualifies it emits a single run summary instead; that is a normal outcome, not
+  an error.
+
+### The parser
+
+The MCP server sends **both** forms of every answer: Markdown in
+`result.content[].text`, and the same table as JSON in
+`result.structuredContent`. The workflow prefers `structuredContent` and falls
+back to a Markdown table parser, so a statement always reaches the filter as one
+shape regardless of which the server produced:
+
+```json
+{"section": "Quarterly Results",
+ "periods": ["Sep 2022", "Dec 2022", "Mar 2023", "Mar 2024", "Mar 2025", "Dec 2025", "Mar 2026"],
+ "rows": {"Sales": ["14.32", "35.65", "78.16", "143.76", "19.86", "103.89", "63.66"],
+          "Net Profit": [...]}}
+```
+
+`rows` is keyed by line item and every array lines up with `periods`, so a
+figure is addressable by name and quarter rather than by position in a list.
+Which path was taken shows up as `via: "structuredContent" | "markdown"` on the
+output and in the logs.
+
+### The filter
+
+A stock's data is returned **only** when its quarterly table actually has the
+target column:
+
+```js
+const TARGET_PERIOD = 'Sep 2026';   // top of "Filter On Sep 2026 Column"
+```
+
+That one line is the whole gate, and it is the one thing to change when the
+quarter rolls over. Matching ignores case and surrounding whitespace and treats
+`Sept 2026` as `Sep 2026`.
+
+> **Expect zero qualifiers for a while.** The Sep-2026 quarter has not ended
+> yet, so no company has filed it and nothing will match. That is the workflow
+> working: it is a detector for the moment the new column appears, and it will
+> start returning stocks as companies file. To watch it fire on real data now,
+> point `TARGET_PERIOD` at a quarter that exists — with `Mar 2026` the current
+> list qualifies `KOTYARK` and returns its full table.
+
+### The logs
+
+`/home/node/.n8n/univest-results/logs/`, one JSON object per line, appended on
+every run — both outcomes, so the files are a complete record and not just a
+record of the good runs.
+
+| File | One line per |
+|---|---|
+| `qualified.jsonl` | stock that had the target column |
+| `failures.jsonl` | stock that did not qualify, errored, or was skipped |
+| `runs.jsonl` | run — the counts, so you can see coverage at a glance |
+
+**Qualified** — which stock, and when it qualified (`ts` is the run that first
+saw the column; `resultDate` is when the company was due to report):
+
+```json
+{"ts":"2026-09-04T09:54:43.377Z","runId":"20260904T095440Z","event":"qualified",
+ "company":"Kotyark Industries Ltd.","symbol":"KOTYARK","rawSymbol":"KOTYARK-BE",
+ "exchange":"NSE","finCode":303646,"resultDate":"2026-09-07",
+ "matchedPeriod":"Mar 2026","periods":["Sep 2022", ...],
+ "via":"structuredContent","variant":"consolidated"}
+```
+
+**Failure** — when, why, and the payload it failed for:
+
+```json
+{"ts":"2026-09-04T09:54:43.377Z","event":"failed","stage":"mcp-tool",
+ "company":"SSPN Finance Ltd.","symbol":"SSPNFIN","resultDate":"2026-09-07",
+ "reason":"the screener MCP server could not return quarterly results",
+ "error":"Error: Screener.in returned 404 for https://www.screener.in/company/SSPNFIN/consolidated/ ...",
+ "payload":{"variant":"consolidated","raw":"...","apiRecord":{"finCode":273425, ...}}}
+```
+
+`payload.apiRecord` is the untouched API record, so any failure can be replayed
+against the exact input that produced it. `stage` says where it broke:
+
+| `event` / `stage` | Meaning |
+|---|---|
+| `not-qualified` / `filter` | the table came back fine, it just has no target column |
+| `failed` / `mcp-tool` | screener 404, a delisted scrip, a bad ticker |
+| `failed` / `mcp-query` | the `node -e` call printed nothing parseable |
+| `failed` / `parse` | neither `structuredContent` nor a Markdown table |
+| `failed` / `pairing` | an answer came back for the wrong stock (should never fire) |
+| `failed` / `mcp-health` | the MCP server was down; no stock was checked at all |
+| `skipped` / `symbol` | the API record had no usable ticker |
+
+> ⚠ **The bearer token is inline in the workflow JSON**, on the
+> **Fetch Upcoming Results** node, and this file is in git — so it is in the
+> history from the commit that added it. Before this leaves testing, move it to
+> an n8n credential (Header Auth) and rotate the one that is checked in.
+
+> Like every workflow here, this one is a **manual import**. Nothing in the
+> pipeline updates n8n from the repo — editing the JSON here changes a file the
+> container never reads. Re-import after every change.
 
 ## Notes on the data source
 

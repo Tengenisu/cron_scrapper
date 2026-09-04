@@ -1,0 +1,518 @@
+{
+  "name": "univest upcoming results :: screener MCP + Sep 2026 filter",
+  "nodes": [
+    {
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -660,
+        -180
+      ],
+      "parameters": {},
+      "id": "b0000001-0000-4000-8000-000000000001"
+    },
+    {
+      "name": "Every 5 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -660,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "notes": "Testing cadence. The MCP build/start steps are idempotent, so a tick that lands on a healthy server costs one tools/list probe.",
+      "id": "b0000002-0000-4000-8000-000000000002"
+    },
+    {
+      "name": "Called By Supervisor",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        -660,
+        180
+      ],
+      "parameters": {},
+      "id": "b0000003-0000-4000-8000-000000000003"
+    },
+    {
+      "name": "Build MCP Server",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        -440,
+        0
+      ],
+      "parameters": {
+        "command": "set -e\nDIR=/home/node/.n8n/screener-mcp-server\nREPO=https://github.com/shivamg194-lab/screener-mcp-server.git\nTARBALL=https://codeload.github.com/shivamg194-lab/screener-mcp-server/tar.gz/refs/heads/main\n\n# --- fetch or update the repo (git if present, tarball fallback) ---\nif [ -d \"$DIR/.git\" ]; then\n  git -C \"$DIR\" pull --ff-only || true\nelif command -v git >/dev/null 2>&1; then\n  git clone --depth 1 \"$REPO\" \"$DIR\"\nelse\n  echo 'git not found in container, falling back to tarball'\n  mkdir -p \"$DIR\"\n  wget -qO- \"$TARBALL\" | tar xz --strip-components=1 -C \"$DIR\"\nfi\n\ncd \"$DIR\"\n\n# --- install deps INCLUDING devDependencies ---\n# The n8n image sets NODE_ENV=production, which makes npm skip devDeps and\n# leaves typescript missing, so the build would fail. Force it here.\nif [ -f package-lock.json ]; then\n  NODE_ENV=development npm ci --include=dev --no-audit --no-fund \\\n    || NODE_ENV=development npm install --include=dev --no-audit --no-fund\nelse\n  NODE_ENV=development npm install --include=dev --no-audit --no-fund\nfi\n\n# --- build (call tsc directly; `npm run build` also runs chmod) ---\n./node_modules/.bin/tsc -p tsconfig.json\n\ntest -f dist/index.js || { echo 'BUILD_FAILED: dist/index.js missing'; exit 1; }\necho \"BUILD_OK node=$(node -v) dir=$DIR\""
+      },
+      "notes": "Unchanged from the supervisor workflow: check out screener-mcp-server, install devDeps, tsc. Prints BUILD_OK.",
+      "id": "b0000004-0000-4000-8000-000000000004"
+    },
+    {
+      "name": "Start If Not Running",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        -240,
+        0
+      ],
+      "parameters": {
+        "command": "DIR=/home/node/.n8n/screener-mcp-server\nPORT=3123\nLOG=/home/node/.n8n/screener-mcp.log\nPROBE='{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}'\n\n# --- already listening? then do nothing (idempotent restart-safe) ---\nif wget -q -O /dev/null --timeout=3 \\\n     --header='Content-Type: application/json' \\\n     --header='Accept: application/json, text/event-stream' \\\n     --post-data=\"$PROBE\" \"http://127.0.0.1:$PORT/mcp\" 2>/dev/null; then\n  echo \"ALREADY_RUNNING port=$PORT\"\n  exit 0\nfi\n\ncd \"$DIR\"\n# Detach so the process outlives this node's execution. It still dies if the\n# n8n container restarts - that is what the 10-minute schedule is for.\nif command -v setsid >/dev/null 2>&1; then\n  TRANSPORT=http PORT=$PORT setsid node dist/index.js >> \"$LOG\" 2>&1 &\nelse\n  ( TRANSPORT=http PORT=$PORT nohup node dist/index.js >> \"$LOG\" 2>&1 & )\nfi\n\nsleep 3\necho \"STARTED port=$PORT log=$LOG\"\ntail -n 5 \"$LOG\" 2>/dev/null || true"
+      },
+      "notes": "Unchanged from the supervisor workflow: idempotent - probes the port first and only starts a detached server if nothing answers.",
+      "id": "b0000005-0000-4000-8000-000000000005"
+    },
+    {
+      "name": "Wait 5s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -40,
+        0
+      ],
+      "webhookId": "a7f1c2e4-0b3d-4a55-9c61-8e2d5f0a1b34",
+      "parameters": {
+        "amount": 5
+      },
+      "notes": "Give a freshly started server time to bind the port before the health check.",
+      "id": "b0000006-0000-4000-8000-000000000006"
+    },
+    {
+      "name": "Health Check (tools/list)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        160,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:3123/mcp",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json, text/event-stream"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "notes": "Unchanged from the supervisor workflow. neverError is on so an unhealthy server routes to the failure branch instead of aborting the run.",
+      "id": "b0000007-0000-4000-8000-000000000007"
+    },
+    {
+      "name": "Healthy?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        360,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1000000-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.result?.tools?.length || 0 }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "notes": "true only when tools/list came back with at least one tool. Everything downstream can assume a live MCP endpoint.",
+      "id": "b0000008-0000-4000-8000-000000000008"
+    },
+    {
+      "name": "Fetch Upcoming Results",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        580,
+        -120
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.univest.in/resources/stock-details/upcoming-results",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiI1NjA1ODAzIiwiaWF0IjoxNzg1MjE0MDA4fQ.Y4r6V94_L9Mh8WCWM6mu3UEyMEJcWulI_lyn7jyTuZ0PekjXWyIzJmFzy7rQ_eTh"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "notes": "The stock list. Answers { data: { \"<result date>\": [ {finCode, compName, nseSymbol, bseSymbol, ...} ] } }. fullResponse keeps the status code so a bad answer can be logged with its payload instead of aborting the run. MOVE THE BEARER TOKEN INTO AN N8N CREDENTIAL BEFORE THIS LEAVES TESTING.",
+      "id": "b0000009-0000-4000-8000-000000000009"
+    },
+    {
+      "name": "Flatten Upcoming Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        -120
+      ],
+      "parameters": {
+        "jsCode": "// The API groups its answer by result date:\n//   { data: { \"2026-09-07\": [ { finCode, compName, nseSymbol, bseSymbol, ... } ] } }\n// Flatten that to one item per stock and keep only what the MCP lookup needs.\n//\n// NSE symbols here carry the trading *series* suffix - DHTL-SM (SME board),\n// KOTYARK-BE (book entry), also -BZ / -BL / -ST / -IL / -RT. screener.in knows\n// the bare ticker only: /company/DHTL-SM/ is a 404 and /company/DHTL/ is not,\n// so the suffix is stripped before anything is looked up.\nconst SERIES = /-(SM|ST|BE|BZ|BL|IL|RT|GB|GS|MF|IV|EQ|N[0-9]|W[0-9]|Y[0-9])$/i;\n\n// Only a symbol matching this may reach the shell in the next node.\nconst SAFE = /^[A-Za-z0-9][A-Za-z0-9&.\\-]{0,30}$/;\n\nconst runId = new Date().toISOString().replace(/[-:]/g, '').replace(/\\..+$/, 'Z');\nconst out = [];\n\nfor (const item of $input.all()) {\n  // fullResponse is on, so the document is under body and the status is visible.\n  const status = item.json?.statusCode ?? null;\n  const body = item.json?.body ?? item.json ?? {};\n  const buckets = body?.data ?? null;\n\n  if (status !== null && (status < 200 || status >= 300)) {\n    out.push({ json: { runId, usable: false, company: null, symbol: null, rawSymbol: null,\n      exchange: null, finCode: null, resultDate: null,\n      skipReason: `the upcoming-results API answered HTTP ${status}`,\n      apiRecord: { statusCode: status, body: JSON.stringify(body).slice(0, 1000) } } });\n    continue;\n  }\n\n  if (!buckets || typeof buckets !== 'object') {\n    out.push({ json: { runId, usable: false, company: null, symbol: null, rawSymbol: null,\n      exchange: null, finCode: null, resultDate: null,\n      skipReason: 'the upcoming-results API returned no data object',\n      apiRecord: { statusCode: status, body: JSON.stringify(body).slice(0, 1000) } } });\n    continue;\n  }\n\n  for (const [resultDate, rows] of Object.entries(buckets)) {\n    for (const row of Array.isArray(rows) ? rows : []) {\n      const raw = String(row.nseSymbol ?? row.bseSymbol ?? '').trim();\n      const symbol = raw.replace(SERIES, '').toUpperCase();\n      const usable = SAFE.test(symbol);\n      out.push({ json: {\n        runId,\n        resultDate,\n        finCode: row.finCode ?? null,\n        company: row.compName ?? null,\n        rawSymbol: raw || null,\n        symbol,\n        exchange: row.nseSymbol ? 'NSE' : (row.bseSymbol ? 'BSE' : null),\n        details: String(row.details ?? '').trim() || null,\n        usable,\n        skipReason: usable ? null\n          : (raw ? `\"${raw}\" does not reduce to a plain ticker` : 'the record carries no nseSymbol or bseSymbol'),\n        // kept whole so a failure can be replayed against the exact input\n        apiRecord: row,\n      } });\n    }\n  }\n}\n\nif (out.length === 0) {\n  return [{ json: { runId, usable: false, company: null, symbol: null, rawSymbol: null,\n    exchange: null, finCode: null, resultDate: null,\n    skipReason: 'the upcoming-results API listed no stocks', apiRecord: null } }];\n}\nreturn out;"
+      },
+      "notes": "Date buckets -> one item per stock, with the NSE series suffix stripped (DHTL-SM -> DHTL, KOTYARK-BE -> KOTYARK) because screener.in only knows the bare ticker. Anything that will not reduce to a safe ticker is marked usable:false and never reaches the shell.",
+      "id": "b0000010-0000-4000-8000-000000000010"
+    },
+    {
+      "name": "Query Screener MCP",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        980,
+        -120
+      ],
+      "parameters": {
+        "command": "=# One screener MCP call per stock: the quarterly results table.\n#\n# The script is inlined with node -e and therefore lives inside a shell\n# single-quoted string - it deliberately contains no single quote of its own.\n# SYMBOL is empty for any stock the flatten step could not reduce to a plain\n# ticker, and the script reports that as an error rather than querying junk.\n# It never exits non-zero and always prints exactly one JSON document.\n\nSYMBOL=\"{{ $json.usable ? $json.symbol : \"\" }}\" \\\nMCP_ENDPOINT=\"http://127.0.0.1:3123/mcp\" \\\nMCP_TIMEOUT_MS=30000 \\\nnode -e 'const ep = process.env.MCP_ENDPOINT || \"http://127.0.0.1:3123/mcp\";\nconst sym = process.env.SYMBOL || \"\";\nconst ms = Number(process.env.MCP_TIMEOUT_MS || 30000);\nconst emit = (o) => process.stdout.write(JSON.stringify(o));\nconst call = async (consolidated) => {\n  const ac = new AbortController();\n  const timer = setTimeout(() => ac.abort(), ms);\n  try {\n    const r = await fetch(ep, {\n      method: \"POST\",\n      headers: { \"Content-Type\": \"application/json\", Accept: \"application/json, text/event-stream\", \"Cache-Control\": \"no-cache\" },\n      body: JSON.stringify({ jsonrpc: \"2.0\", id: Date.now(), method: \"tools/call\", params: { name: \"screener_get_financial_statement\", arguments: { identifier: sym, statement: \"quarters\", consolidated: consolidated } } }),\n      signal: ac.signal\n    });\n    const body = await r.text();\n    if (!r.ok) return { ok: false, error: \"MCP HTTP \" + r.status, raw: body.slice(0, 400) };\n    const s = body.trim();\n    let env = null;\n    if (s.charAt(0) === \"{\") { env = JSON.parse(s); }\n    else {\n      const lines = s.split(/\\r?\\n/).filter((l) => l.indexOf(\"data:\") === 0);\n      if (lines.length === 0) return { ok: false, error: \"unparseable MCP response\", raw: s.slice(0, 400) };\n      env = JSON.parse(lines[lines.length - 1].slice(5).trim());\n    }\n    if (env.error) return { ok: false, error: \"RPC \" + (env.error.message || JSON.stringify(env.error)) };\n    const res = env.result || {};\n    const text = (res.content || []).map((c) => c.text || \"\").join(\"\\n\").trim();\n    if (res.isError) return { ok: false, error: text.split(\"\\n\")[0] || \"tool reported an error\", raw: text.slice(0, 400) };\n    return { ok: true, structured: res.structuredContent, text: text };\n  } catch (e) {\n    const msg = e && e.name === \"AbortError\" ? \"timed out after \" + ms + \"ms\" : String((e && e.message) || e);\n    return { ok: false, error: \"REQUEST FAILED: \" + msg };\n  } finally { clearTimeout(timer); }\n};\nconst isEmpty = (x) => Boolean(x.ok && x.structured && Array.isArray(x.structured.periods) && x.structured.periods.length === 0);\n(async () => {\n  if (!sym) { emit({ ok: false, symbol: sym, error: \"no usable symbol was supplied for this stock\" }); return; }\n  let res = await call(true);\n  let variant = \"consolidated\";\n  if (!res.ok || isEmpty(res)) {\n    const alt = await call(false);\n    if (alt.ok && !isEmpty(alt)) { res = alt; variant = \"standalone\"; }\n  }\n  emit({ ok: res.ok, symbol: sym, variant: variant, error: res.error || null, structured: res.structured, text: res.text, raw: res.raw });\n})();'"
+      },
+      "notes": "Runs once per stock. node -e posts one tools/call for screener_get_financial_statement (quarters) and prints one JSON document. Falls back from consolidated to standalone when consolidated is missing or empty. Never exits non-zero.",
+      "id": "b0000011-0000-4000-8000-000000000011"
+    },
+    {
+      "name": "Filter On Sep 2026 Column",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1180,
+        -120
+      ],
+      "parameters": {
+        "jsCode": "// Parse every MCP answer into JSON, then keep only the stocks whose quarterly\n// table actually carries the target column. Runs once for all items and returns\n// a single item: the log writer downstream must fire once, not once per stock.\n//\n// >>> The one line to change when the quarter rolls over: <<<\nconst TARGET_PERIOD = 'Sep 2026';\n\nconst stocks = $('Flatten Upcoming Results').all().map((i) => i.json);\nconst replies = $input.all().map((i) => i.json);\nconst ts = new Date().toISOString();\nconst runId = stocks[0]?.runId ?? ts.replace(/[-:]/g, '').replace(/\\..+$/, 'Z');\n\n// --------------------------------------------------------------------------\n// The parser.\n//\n// The MCP server answers with Markdown in content[].text and the same table as\n// JSON in structuredContent. structuredContent is preferred; the Markdown\n// parser below is the fallback for when it is absent, so a statement always\n// reaches the filter in one shape no matter which form the server sent.\n// --------------------------------------------------------------------------\nconst splitRow = (line) => line.trim().replace(/^\\|/, '').replace(/\\|$/, '').split('|').map((c) => c.trim());\nconst isSeparator = (cells) => cells.length > 0 && cells.every((c) => /^:?-{2,}:?$/.test(c));\n\nfunction parseMarkdownTable(text) {\n  if (!text) return null;\n  const lines = String(text).split(/\\r?\\n/);\n  const heading = lines.find((l) => /^#{1,6}\\s/.test(l.trim()));\n  const pipeRows = lines.filter((l) => l.trim().startsWith('|')).map(splitRow);\n  const sepAt = pipeRows.findIndex(isSeparator);\n  if (sepAt < 1) return null; // no header row above a separator: not a table\n  return {\n    section: heading ? heading.trim().replace(/^#+\\s*/, '') : null,\n    periods: pipeRows[sepAt - 1].slice(1).filter((h) => h !== ''),\n    rows: pipeRows.slice(sepAt + 1)\n      .map((c) => ({ label: c[0] ?? null, values: c.slice(1) }))\n      .filter((r) => r.label),\n    via: 'markdown',\n  };\n}\n\nfunction toStatement(reply) {\n  const sc = reply?.structured;\n  if (sc && Array.isArray(sc.periods)) {\n    return { section: sc.section ?? null, periods: sc.periods, rows: sc.rows ?? [], via: 'structuredContent' };\n  }\n  return parseMarkdownTable(reply?.text);\n}\n\n// [{label, values}] -> {label: values}, padded to the period count, so a line\n// item is addressable by name and every row lines up with `periods`.\nfunction rowsToObject(rows, periods) {\n  const out = {};\n  for (const row of Array.isArray(rows) ? rows : []) {\n    if (!row?.label) continue;\n    const values = Array.isArray(row.values) ? row.values : [];\n    out[row.label] = periods.map((_, i) => (values[i] === undefined || values[i] === '' ? null : values[i]));\n  }\n  return out;\n}\n\n// \"Sept 2026\" and \" sep 2026 \" name the same column as \"Sep 2026\".\nconst key = (p) => String(p).replace(/\\s+/g, ' ').trim().toLowerCase().replace(/^sept\\b/, 'sep');\nconst samePeriod = (a, b) => key(a) === key(b);\n\n// --------------------------------------------------------------------------\nconst qualified = [];\nconst failures = [];\n\nfor (let i = 0; i < stocks.length; i++) {\n  const stock = stocks[i];\n  const who = {\n    runId,\n    company: stock.company,\n    symbol: stock.symbol || null,\n    rawSymbol: stock.rawSymbol,\n    exchange: stock.exchange,\n    finCode: stock.finCode,\n    resultDate: stock.resultDate,\n  };\n\n  // 1. never reached the MCP server at all\n  if (!stock.usable) {\n    failures.push({ ts, event: 'skipped', stage: 'symbol', ...who,\n      reason: stock.skipReason, error: null, payload: { apiRecord: stock.apiRecord } });\n    continue;\n  }\n\n  // 2. the shell / transport layer\n  const raw = replies[i];\n  let reply = null;\n  try {\n    const stdout = String(raw?.stdout ?? '').trim();\n    if (!stdout) throw new Error('the query printed nothing (exit ' + (raw?.exitCode ?? '?') + ')');\n    const at = stdout.indexOf('{');\n    if (at < 0) throw new Error('no JSON document on stdout');\n    reply = JSON.parse(stdout.slice(at));\n  } catch (err) {\n    failures.push({ ts, event: 'failed', stage: 'mcp-query', ...who,\n      reason: 'the MCP query produced no parseable JSON',\n      error: err.message,\n      payload: {\n        exitCode: raw?.exitCode ?? null,\n        stdout: String(raw?.stdout ?? '').slice(0, 800),\n        stderr: String(raw?.stderr ?? '').slice(-800),\n        apiRecord: stock.apiRecord,\n      } });\n    continue;\n  }\n\n  // Execute Command emits one output item per input item, in order, so index i\n  // pairs them. Guard the assumption rather than trusting it silently.\n  if (reply.symbol && reply.symbol !== stock.symbol) {\n    failures.push({ ts, event: 'failed', stage: 'pairing', ...who,\n      reason: 'the MCP answer did not belong to this stock',\n      error: 'expected ' + stock.symbol + ', the query answered for ' + reply.symbol,\n      payload: { reply, apiRecord: stock.apiRecord } });\n    continue;\n  }\n\n  // 3. the tool itself\n  if (!reply.ok) {\n    failures.push({ ts, event: 'failed', stage: 'mcp-tool', ...who,\n      reason: 'the screener MCP server could not return quarterly results',\n      error: reply.error ?? null,\n      payload: { variant: reply.variant ?? null, raw: String(reply.raw ?? '').slice(0, 600), apiRecord: stock.apiRecord } });\n    continue;\n  }\n\n  // 4. the parser\n  const statement = toStatement(reply);\n  if (!statement) {\n    failures.push({ ts, event: 'failed', stage: 'parse', ...who,\n      reason: 'the answer held neither structuredContent nor a Markdown table',\n      error: null,\n      payload: { variant: reply.variant ?? null, text: String(reply.text ?? '').slice(0, 600), apiRecord: stock.apiRecord } });\n    continue;\n  }\n\n  // 5. the filter - the whole point of this workflow\n  const periods = Array.isArray(statement.periods) ? statement.periods : [];\n  const matched = periods.find((p) => samePeriod(p, TARGET_PERIOD)) ?? null;\n\n  if (!matched) {\n    failures.push({ ts, event: 'not-qualified', stage: 'filter', ...who,\n      reason: periods.length === 0\n        ? 'screener has no quarterly table for this stock yet, so it cannot have a \"' + TARGET_PERIOD + '\" column'\n        : 'the quarterly table has no \"' + TARGET_PERIOD + '\" column',\n      error: null,\n      payload: { via: statement.via, variant: reply.variant ?? null, periods, apiRecord: stock.apiRecord } });\n    continue;\n  }\n\n  qualified.push({ ts, ...who,\n    matchedPeriod: matched,\n    targetPeriod: TARGET_PERIOD,\n    via: statement.via,\n    variant: reply.variant ?? null,\n    quarters: { section: statement.section, periods, rows: rowsToObject(statement.rows, periods) },\n  });\n}\n\n// --------------------------------------------------------------------------\n// Log lines. The qualified log is deliberately slim - the full quarterly table\n// travels in the workflow output, not into a file that grows every 5 minutes.\nconst qualifiedLog = qualified.map((q) => ({\n  ts: q.ts, runId, event: 'qualified', company: q.company, symbol: q.symbol,\n  rawSymbol: q.rawSymbol, exchange: q.exchange, finCode: q.finCode,\n  resultDate: q.resultDate, matchedPeriod: q.matchedPeriod,\n  periods: q.quarters.periods, via: q.via, variant: q.variant,\n}));\n\nconst count = (e) => failures.filter((f) => f.event === e).length;\nconst summary = {\n  ts, runId, targetPeriod: TARGET_PERIOD, checked: stocks.length,\n  qualified: qualified.length, notQualified: count('not-qualified'),\n  failed: count('failed'), skipped: count('skipped'),\n};\n\nconst jsonl = (arr) => arr.map((o) => JSON.stringify(o)).join('\\n');\n\nreturn [{ json: {\n  ok: true,\n  ...summary,\n  results: qualified,\n  failures,\n  logs: {\n    qualifiedJsonl: jsonl(qualifiedLog),\n    failuresJsonl: jsonl(failures),\n    runJsonl: JSON.stringify(summary),\n  },\n} }];"
+      },
+      "notes": "Parses every answer to JSON (structuredContent first, Markdown table parser as fallback), then keeps only stocks whose periods contain the target column. Change TARGET_PERIOD at the top when the quarter rolls over. Returns a single item so the log writer fires once.",
+      "id": "b0000012-0000-4000-8000-000000000012"
+    },
+    {
+      "name": "Write Run Log",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1380,
+        -120
+      ],
+      "parameters": {
+        "command": "=# One append per run, for both outcomes:\n#\n#   qualified.jsonl  which stock qualified and when (ts + resultDate + the\n#                    matched column, plus every period screener showed)\n#   failures.jsonl   when it failed, why, and the payload it failed for\n#                    (the API record, and whatever the MCP server said)\n#   runs.jsonl       one summary line per run\n#\n# Heredocs are quoted, so a $ or a backtick inside the JSON stays literal.\nset -u\nDIR=/home/node/.n8n/univest-results/logs\nmkdir -p \"$DIR\"\n\nappend() {\n  BODY=$(cat)\n  if [ -n \"$BODY\" ]; then printf \"%s\\n\" \"$BODY\" >> \"$DIR/$1\"; fi\n  return 0\n}\n\nappend qualified.jsonl <<'Q_EOF'\n{{ $json.logs.qualifiedJsonl }}\nQ_EOF\n\nappend failures.jsonl <<'F_EOF'\n{{ $json.logs.failuresJsonl }}\nF_EOF\n\nappend runs.jsonl <<'R_EOF'\n{{ $json.logs.runJsonl }}\nR_EOF\n\necho \"LOGGED run={{ $json.runId }} target={{ $json.targetPeriod }} checked={{ $json.checked }} qualified={{ $json.qualified }} notQualified={{ $json.notQualified }} failed={{ $json.failed }} skipped={{ $json.skipped }}\"\nwc -l \"$DIR\"/*.jsonl 2>/dev/null || true"
+      },
+      "notes": "Appends qualified.jsonl, failures.jsonl and runs.jsonl under /home/node/.n8n/univest-results/logs. One shell run per workflow execution, not per stock.",
+      "id": "b0000013-0000-4000-8000-000000000013"
+    },
+    {
+      "name": "Return Qualified Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1580,
+        -120
+      ],
+      "parameters": {
+        "jsCode": "// Fan the run back out to one item per qualifying stock.\n//\n// Read from the classifier rather than from $input: the log writer sits between\n// them and Execute Command replaces the item with {exitCode, stdout, stderr}.\nconst run = $('Filter On Sep 2026 Column').first().json;\nconst logged = $input.first().json;\n\nconst base = {\n  ok: true,\n  runId: run.runId,\n  ts: run.ts,\n  targetPeriod: run.targetPeriod,\n  logWritten: (logged?.exitCode ?? 0) === 0,\n  logDir: '/home/node/.n8n/univest-results/logs',\n};\n\n// Nothing qualified is a normal outcome, not an error - most runs will land\n// here until companies start filing the target quarter. The run summary still\n// comes out so the caller can see what was checked.\nif (!Array.isArray(run.results) || run.results.length === 0) {\n  return [{ json: {\n    ...base,\n    qualified: 0,\n    reason: 'no stock has a \"' + run.targetPeriod + '\" column yet',\n    checked: run.checked,\n    notQualified: run.notQualified,\n    failed: run.failed,\n    skipped: run.skipped,\n    failures: run.failures,\n  } }];\n}\n\nreturn run.results.map((stock) => ({ json: { ...base, ...stock } }));"
+      },
+      "notes": "One item per qualifying stock, carrying the parsed quarterly table. When nothing qualified it emits a single run summary - a normal outcome, not an error.",
+      "id": "b0000014-0000-4000-8000-000000000014"
+    },
+    {
+      "name": "Dump MCP Log",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        580,
+        180
+      ],
+      "parameters": {
+        "command": "tail -n 40 /home/node/.n8n/screener-mcp.log 2>/dev/null || echo \"no log file at /home/node/.n8n/screener-mcp.log\""
+      },
+      "notes": "The server did not answer tools/list. Its own log is the only thing that says why.",
+      "id": "b0000015-0000-4000-8000-000000000015"
+    },
+    {
+      "name": "Build Health Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        180
+      ],
+      "parameters": {
+        "jsCode": "// The MCP server never answered tools/list, so not one stock could be checked.\n// That is a run-level failure and belongs in the same failures.jsonl as the\n// per-stock ones, with the tail of the server log as the payload it failed for.\n//\n// The record is built here rather than inside an expression on the shell node:\n// an object literal inside {{ }} is exactly the thing older n8n expression\n// parsers get wrong, and a log writer that silently emits nothing is worse than\n// no log writer at all.\nconst ts = new Date().toISOString();\nconst runId = ts.replace(/[-:]/g, '').replace(/\\..+$/, 'Z');\nconst mcpLog = String($input.first().json?.stdout ?? '').slice(-1500);\n\nconst record = {\n  ts,\n  runId,\n  event: 'failed',\n  stage: 'mcp-health',\n  company: null,\n  symbol: null,\n  rawSymbol: null,\n  exchange: null,\n  finCode: null,\n  resultDate: null,\n  reason: 'the screener MCP server did not answer tools/list, so no stock was checked',\n  error: mcpLog.split('\\n').filter(Boolean).slice(-1)[0] ?? 'no output from the MCP log',\n  payload: { endpoint: 'http://127.0.0.1:3123/mcp', mcpLogTail: mcpLog },\n};\n\nreturn [{ json: {\n  ok: false,\n  ...record,\n  logLine: JSON.stringify(record),\n  runLine: JSON.stringify({ ts, runId, targetPeriod: null, checked: 0, qualified: 0, notQualified: 0, failed: 1, skipped: 0 }),\n} }];"
+      },
+      "notes": "Builds the failures.jsonl record for a dead MCP server, with the tail of its log as the payload. Built in code, not in an expression, so the log writer downstream only has to interpolate one ready-made string.",
+      "id": "b0000016-0000-4000-8000-000000000016"
+    },
+    {
+      "name": "Write Health Failure",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        980,
+        180
+      ],
+      "parameters": {
+        "command": "# Same two files as the healthy branch, so the logs are a complete\n# record of every run and not just of the ones that got as far as a stock.\nset -u\nDIR=/home/node/.n8n/univest-results/logs\nmkdir -p \"$DIR\"\n\ncat >> \"$DIR/failures.jsonl\" <<'E_EOF'\n{{ $json.logLine }}\nE_EOF\n\ncat >> \"$DIR/runs.jsonl\" <<'R_EOF'\n{{ $json.runLine }}\nR_EOF\n\necho \"LOGGED mcp-health failure run={{ $json.runId }} to $DIR/failures.jsonl\""
+      },
+      "notes": "Appends the health failure to failures.jsonl and a zero-checked summary to runs.jsonl.",
+      "id": "b0000017-0000-4000-8000-000000000017"
+    },
+    {
+      "name": "MCP Unhealthy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1180,
+        180
+      ],
+      "parameters": {
+        "jsCode": "// Terminal state for the unhealthy branch: a parseable failure document, so a\n// caller (or the supervisor) never has to tell \"MCP was down\" apart from\n// \"the workflow produced nothing\".\nconst failure = $('Build Health Failure').first().json;\nconst written = $input.first().json;\n\nreturn [{ json: {\n  ok: false,\n  stage: 'mcp-health',\n  runId: failure.runId,\n  ts: failure.ts,\n  error: 'screener MCP server is not answering tools/list on http://127.0.0.1:3123/mcp',\n  reason: failure.reason,\n  mcpLogTail: failure.payload?.mcpLogTail ?? null,\n  logWritten: (written?.exitCode ?? 0) === 0,\n  logDir: '/home/node/.n8n/univest-results/logs',\n} }];"
+      },
+      "notes": "Terminal state for the unhealthy branch: a parseable failure document rather than a silently empty run.",
+      "id": "b0000018-0000-4000-8000-000000000018"
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build MCP Server",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 5 minutes": {
+      "main": [
+        [
+          {
+            "node": "Build MCP Server",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Called By Supervisor": {
+      "main": [
+        [
+          {
+            "node": "Build MCP Server",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build MCP Server": {
+      "main": [
+        [
+          {
+            "node": "Start If Not Running",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start If Not Running": {
+      "main": [
+        [
+          {
+            "node": "Wait 5s",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 5s": {
+      "main": [
+        [
+          {
+            "node": "Health Check (tools/list)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Health Check (tools/list)": {
+      "main": [
+        [
+          {
+            "node": "Healthy?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Healthy?": {
+      "main": [
+        [
+          {
+            "node": "Fetch Upcoming Results",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dump MCP Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Upcoming Results": {
+      "main": [
+        [
+          {
+            "node": "Flatten Upcoming Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flatten Upcoming Results": {
+      "main": [
+        [
+          {
+            "node": "Query Screener MCP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Screener MCP": {
+      "main": [
+        [
+          {
+            "node": "Filter On Sep 2026 Column",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter On Sep 2026 Column": {
+      "main": [
+        [
+          {
+            "node": "Write Run Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Run Log": {
+      "main": [
+        [
+          {
+            "node": "Return Qualified Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dump MCP Log": {
+      "main": [
+        [
+          {
+            "node": "Build Health Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Health Failure": {
+      "main": [
+        [
+          {
+            "node": "Write Health Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Health Failure": {
+      "main": [
+        [
+          {
+            "node": "MCP Unhealthy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "executionTimeout": 900
+  },
+  "meta": {
+    "instanceId": "univest-upcoming-results"
+  },
+  "pinData": {},
+  "tags": []
+}

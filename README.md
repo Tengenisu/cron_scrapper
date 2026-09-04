@@ -467,8 +467,8 @@ imported scraper workflow (its `workflowId` currently reads
 
 `n8n-workflows/univest-upcoming-results.json` — a second, independent pipeline.
 It does not use this repo's scraper at all: the stock list comes from Univest's
-own API instead of from Moneycontrol, and the only thing it asks the MCP server
-for is the quarterly results table.
+own API instead of from Moneycontrol, and each stock is put through the full
+screener MCP dump - the same 19 calls the manual `node -e` one-liner makes.
 
 ```
 Manual Trigger ─┐
@@ -476,9 +476,11 @@ Every 5 minutes ─┼→ Build MCP Server → Start If Not Running → Wait 5s 
 Called By Supervisor ─┘                                                                    │
    ┌───────────────────────────────────────────── true ─────────────────────────────────────┘
    ↓
-Fetch Upcoming Results → Flatten → Query Screener MCP → Filter On Sep 2026 Column
-                                                                    ↓
-                                                    Write Run Log → Return Qualified Data
+Fetch Upcoming Results → Flatten → Query Screener MCP → Parse Dump To JSON
+                                                                ↓
+                                                  Filter On Sep 2026 Column
+                                                                ↓
+                                            Write Run Log → Return Qualified Data
 
    └── false → Dump MCP Log → Build Health Failure → Write Health Failure → MCP Unhealthy
 ```
@@ -497,57 +499,86 @@ the supervisor workflow, so nothing downstream can ever query a dead endpoint.
   `fullResponse` is on, so a non-200 is logged with its body rather than
   aborting the run.
 
-* **Flatten Upcoming Results** — date buckets to one item per stock, and this is
-  where the **series suffix comes off**. The API returns the NSE *trading*
-  symbol, which carries the series: `DHTL-SM` (SME board), `KOTYARK-BE` (book
-  entry), also `-BZ` / `-BL` / `-ST`. screener.in only knows the bare ticker —
+* **Flatten Upcoming Results** — date buckets to one item per stock, keeping
+  **both** symbols: the dump asks the NSE tools for `nseSymbol` and the BSE
+  technicals for `bseSymbol`, so they are carried separately rather than
+  collapsed into one.
+
+  This is also where the **series suffix comes off**. Both symbols arrive with
+  the trading series attached: `DHTL-SM` (SME board), `KOTYARK-BE` (book entry),
+  also `-BZ` / `-BL` / `-ST`. screener.in and Yahoo know the bare ticker only —
   `/company/DHTL-SM/` is a 404 and `/company/DHTL/` is not — so every one of
   those stocks would silently fail without the strip. A symbol that will not
   reduce to `^[A-Za-z0-9][A-Za-z0-9&.-]*$` is marked `usable: false` and never
   reaches the shell.
 
-* **Query Screener MCP** — one `node -e` per stock, posting a single
-  `tools/call` for `screener_get_financial_statement` (`quarters`). It falls
-  back from consolidated to standalone when consolidated is missing or empty,
-  never exits non-zero, and always prints exactly one JSON document.
+* **Query Screener MCP** — one `node -e` per stock, firing the **full 19-job
+  catalogue**: search match · company overview · quarters · profit & loss ·
+  balance sheet · cash flow · ratios · peer comparison · NSE quote ·
+  announcements · corporate actions · RSI 14 / SMA 50 / EMA 200 / MACD on both
+  exchanges. It prints one Markdown document and never exits non-zero.
+
+  Values reach it as environment variables rather than being spliced into the
+  source — `ID` (the screener identifier), `NSE_SYM`, `BSE_SYM`, `FIN_CODE`:
+
+  ```sh
+  ID="KOTYARK" NSE_SYM="KOTYARK" BSE_SYM="KOTYARK" FIN_CODE="303646" node -e '...'
+  ```
 
   > The script is inlined into `node -e '...'`, so it deliberately contains **no
   > single quote anywhere** — double quotes and backticks only. The generator
   > refuses to build if one creeps in. Keep that rule when editing it.
 
-* **Filter On Sep 2026 Column** — the parser and the filter. See below.
+* **Parse Dump To JSON** — the Markdown document to JSON. See below.
+
+* **Filter On Sep 2026 Column** — the gate. See below.
 
 * **Write Run Log** — one shell run per execution (not per stock) appending the
   three log files.
 
-* **Return Qualified Data** — one item per qualifying stock. When nothing
-  qualifies it emits a single run summary instead; that is a normal outcome, not
-  an error.
+* **Return Qualified Data** — one item per qualifying stock, carrying the whole
+  parsed dump. When nothing qualifies it emits a single run summary instead;
+  that is a normal outcome, not an error.
 
 ### The parser
 
-The MCP server sends **both** forms of every answer: Markdown in
-`result.content[].text`, and the same table as JSON in
-`result.structuredContent`. The workflow prefers `structuredContent` and falls
-back to a Markdown table parser, so a statement always reaches the filter as one
-shape regardless of which the server produced:
+The dump node prints the same human-readable Markdown the manual `node -e`
+one-liner does, and **Parse Dump To JSON** turns the whole document into JSON.
+Nothing is discarded: every job becomes an entry under `jobs`, and the original
+Markdown is kept under `markdown` so a shape change upstream can never silently
+lose data.
+
+Jobs are split on their header — `## <LABEL>   [<tool>]`, three spaces then the
+tool in brackets. A tool answer carries headings of its own (`## Quarterly
+Results`) but never the bracket, which is what lets a job header be told apart
+from section markup.
+
+Per job, whichever applies:
+
+| Shape in the Markdown | Becomes |
+|---|---|
+| a Markdown table | `tables: [{columns, rows, values}]` — rows keyed by column, numeric cells coerced |
+| `- Market Cap: ₹ 382 Cr.` | `fields: {"Market Cap": "₹ 382 Cr."}` |
+| `- Company has reduced debt.` | `items: [...]` — a prose bullet, not a field |
+| a JSON body | `data`, parsed |
+| `TOOL ERROR:` / `RPC ERROR:` / `REQUEST FAILED:` | `ok: false` with `error` |
 
 ```json
-{"section": "Quarterly Results",
- "periods": ["Sep 2022", "Dec 2022", "Mar 2023", "Mar 2024", "Mar 2025", "Dec 2025", "Mar 2026"],
- "rows": {"Sales": ["14.32", "35.65", "78.16", "143.76", "19.86", "103.89", "63.66"],
-          "Net Profit": [...]}}
+"QUARTERS": {
+  "tool": "screener_get_financial_statement", "ok": true, "error": null,
+  "tables": [{"columns": ["Line item", "Sep 2022", "...", "Mar 2026"],
+              "rows": [{"Line item": "Sales", "Sep 2022": 14.32, "Mar 2026": 63.66}]}],
+  "fields": {}, "sections": [...], "raw": "## Quarterly Results ..."
+}
 ```
 
-`rows` is keyed by line item and every array lines up with `periods`, so a
-figure is addressable by name and quarter rather than by position in a list.
-Which path was taken shows up as `via: "structuredContent" | "markdown"` on the
-output and in the logs.
+Every distinct column found anywhere in the dump is also collected on the stock
+as `columns`, which is what the filter reads.
 
 ### The filter
 
-A stock's data is returned **only** when its quarterly table actually has the
-target column:
+A stock's dump is returned **only** when the target column appears somewhere in
+it:
 
 ```js
 const TARGET_PERIOD = 'Sep 2026';   // top of "Filter On Sep 2026 Column"
@@ -557,12 +588,18 @@ That one line is the whole gate, and it is the one thing to change when the
 quarter rolls over. Matching ignores case and surrounding whitespace and treats
 `Sept 2026` as `Sep 2026`.
 
+**Every table in every job is searched, not just the quarterly one.** That is
+not incidental: SHIPROCKET's quarterly table is empty on screener, but its
+profit & loss, balance sheet, cash flow and ratios all carry the column — asking
+only for `quarters` would have missed it. `matchedIn` records every job the
+column was found in.
+
 > **Expect zero qualifiers for a while.** The Sep-2026 quarter has not ended
 > yet, so no company has filed it and nothing will match. That is the workflow
 > working: it is a detector for the moment the new column appears, and it will
 > start returning stocks as companies file. To watch it fire on real data now,
 > point `TARGET_PERIOD` at a quarter that exists — with `Mar 2026` the current
-> list qualifies `KOTYARK` and returns its full table.
+> list qualifies `SHIPROCKET` and `KOTYARK` and returns their full dumps.
 
 ### The logs
 
@@ -572,7 +609,7 @@ record of the good runs.
 
 | File | One line per |
 |---|---|
-| `qualified.jsonl` | stock that had the target column |
+| `qualified.jsonl` | stock whose dump had the target column |
 | `failures.jsonl` | stock that did not qualify, errored, or was skipped |
 | `runs.jsonl` | run — the counts, so you can see coverage at a glance |
 
@@ -580,21 +617,25 @@ record of the good runs.
 saw the column; `resultDate` is when the company was due to report):
 
 ```json
-{"ts":"2026-09-04T09:54:43.377Z","runId":"20260904T095440Z","event":"qualified",
- "company":"Kotyark Industries Ltd.","symbol":"KOTYARK","rawSymbol":"KOTYARK-BE",
- "exchange":"NSE","finCode":303646,"resultDate":"2026-09-07",
- "matchedPeriod":"Mar 2026","periods":["Sep 2022", ...],
- "via":"structuredContent","variant":"consolidated"}
+{"ts":"2026-09-04T10:23:20.058Z","runId":"20260904T102258Z","event":"qualified",
+ "company":"Kotyark Industries Ltd.","symbol":"KOTYARK","nseSymbol":"KOTYARK",
+ "bseSymbol":"KOTYARK","rawSymbol":"KOTYARK-BE","finCode":303646,
+ "resultDate":"2026-09-07","matchedColumn":"Mar 2026",
+ "matchedIn":["QUARTERS","PROFIT-LOSS","BALANCE-SHEET","CASH-FLOW","RATIOS"],
+ "jobCount":19,"jobsFailed":2}
 ```
 
 **Failure** — when, why, and the payload it failed for:
 
 ```json
-{"ts":"2026-09-04T09:54:43.377Z","event":"failed","stage":"mcp-tool",
- "company":"SSPN Finance Ltd.","symbol":"SSPNFIN","resultDate":"2026-09-07",
- "reason":"the screener MCP server could not return quarterly results",
- "error":"Error: Screener.in returned 404 for https://www.screener.in/company/SSPNFIN/consolidated/ ...",
- "payload":{"variant":"consolidated","raw":"...","apiRecord":{"finCode":273425, ...}}}
+{"ts":"2026-09-04T10:23:20.058Z","event":"not-qualified","stage":"filter",
+ "company":"Docmode Health Technologies Ltd.","symbol":"DHTL","rawSymbol":"DHTL-SM",
+ "finCode":310722,"resultDate":"2026-09-04",
+ "reason":"no table in the dump has a \"Mar 2026\" column","error":null,
+ "payload":{"columns":["Line item","Mar 2020", ..., "MACD","Signal","Histogram"],
+            "jobCount":19,"jobsFailed":6,
+            "failedJobs":["PEER COMPARISON","NSE LIVE QUOTE","RSI 14 daily [BSE]", ...],
+            "apiRecord":{"finCode":310722, ...}}}
 ```
 
 `payload.apiRecord` is the untouched API record, so any failure can be replayed
@@ -602,12 +643,10 @@ against the exact input that produced it. `stage` says where it broke:
 
 | `event` / `stage` | Meaning |
 |---|---|
-| `not-qualified` / `filter` | the table came back fine, it just has no target column |
-| `failed` / `mcp-tool` | screener 404, a delisted scrip, a bad ticker |
-| `failed` / `mcp-query` | the `node -e` call printed nothing parseable |
-| `failed` / `parse` | neither `structuredContent` nor a Markdown table |
-| `failed` / `pairing` | an answer came back for the wrong stock (should never fire) |
-| `failed` / `mcp-health` | the MCP server was down; no stock was checked at all |
+| `not-qualified` / `filter` | the dump came back fine, no table in it has the target column |
+| `failed` / `mcp-tool` | every one of the 19 jobs errored - a bad ticker, or a dead endpoint |
+| `failed` / `mcp-query` | the `node -e` dump printed nothing at all |
+| `failed` / `mcp-health` | the MCP server was down; no stock was checked |
 | `skipped` / `symbol` | the API record had no usable ticker |
 
 > ⚠ **The bearer token is inline in the workflow JSON**, on the

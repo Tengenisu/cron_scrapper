@@ -142,10 +142,19 @@ export const KEEP_RUNS = envNumber("KEEP_RUNS", 50);
 // A pass over ~8 symbols takes minutes, which is close enough to the 5-minute
 // cadence that ticks can overlap. Runs are serialised with a lock file: a tick
 // that finds a run in flight exits immediately with {"ok": true, "skipped": true}.
-// A lock older than LOCK_STALE_MS is treated as a crashed run and stolen.
+//
+// The lock records its owner's pid, and one whose pid is gone is stolen on the
+// spot — otherwise a run killed by a cancelled n8n execution or by `timeout`
+// leaves a file that makes every later tick skip, which looks exactly like a
+// scraper that has stopped working. LOCK_STALE_MS is only the backstop for the
+// case the pid check can't see (pid reuse, another host on a shared volume), so
+// it is tied to the run deadline rather than being an arbitrary 15 minutes.
 // --------------------------------------------------------------------------- //
 
 export const LOCK_FILE = envString("LOCK_FILE", path.join(PROJECT_ROOT, ".scraper.lock"));
-export const LOCK_STALE_MS = envNumber("LOCK_STALE_MS", 15 * 60 * 1000);
+export const LOCK_STALE_MS = envNumber(
+  "LOCK_STALE_MS",
+  RUN_DEADLINE_MS > 0 ? RUN_DEADLINE_MS + 90_000 : 15 * 60 * 1000
+);
 
 export const LOG_LEVEL = envString("LOG_LEVEL", "info").toLowerCase();

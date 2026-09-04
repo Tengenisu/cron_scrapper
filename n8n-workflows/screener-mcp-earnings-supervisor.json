@@ -1,0 +1,517 @@
+{
+  "name": "screener-mcp + moneycontrol earnings :: supervisor & scraper (5m)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "f1000000-0000-4000-8000-000000000001",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -760,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "f1000000-0000-4000-8000-000000000002",
+      "name": "Every 5 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -760,
+        140
+      ],
+      "notes": "TESTING MODE: every 5 minutes. This one trigger now drives BOTH halves - it keeps the MCP server alive AND runs the scraper. Run either this trigger or the repo's own schedule (crontab.txt / `npm run cron`), never both, or every symbol gets queried twice.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "f1000000-0000-4000-8000-000000000003",
+      "name": "Called By Another Workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        -760,
+        340
+      ],
+      "notes": "Optional entry point, kept so another workflow can still call this one. The supervisor half is now inline, so nothing external has to start the MCP server first.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "command": "set -e\nDIR=/home/node/.n8n/screener-mcp-server\nREPO=https://github.com/shivamg194-lab/screener-mcp-server.git\nTARBALL=https://codeload.github.com/shivamg194-lab/screener-mcp-server/tar.gz/refs/heads/main\n\n# --- fetch or update the repo (git if present, tarball fallback) ---\nif [ -d \"$DIR/.git\" ]; then\n  git -C \"$DIR\" pull --ff-only || true\nelif command -v git >/dev/null 2>&1; then\n  git clone --depth 1 \"$REPO\" \"$DIR\"\nelse\n  echo 'git not found in container, falling back to tarball'\n  mkdir -p \"$DIR\"\n  wget -qO- \"$TARBALL\" | tar xz --strip-components=1 -C \"$DIR\"\nfi\n\ncd \"$DIR\"\n\n# --- install deps INCLUDING devDependencies ---\n# The n8n image sets NODE_ENV=production, which makes npm skip devDeps and\n# leaves typescript missing, so the build would fail. Force it here.\nif [ -f package-lock.json ]; then\n  NODE_ENV=development npm ci --include=dev --no-audit --no-fund \\\n    || NODE_ENV=development npm install --include=dev --no-audit --no-fund\nelse\n  NODE_ENV=development npm install --include=dev --no-audit --no-fund\nfi\n\n# --- build (call tsc directly; `npm run build` also runs chmod) ---\n./node_modules/.bin/tsc -p tsconfig.json\n\ntest -f dist/index.js || { echo 'BUILD_FAILED: dist/index.js missing'; exit 1; }\necho \"BUILD_OK node=$(node -v) dir=$DIR\""
+      },
+      "id": "f1000000-0000-4000-8000-000000000004",
+      "name": "Build MCP Server",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        -520,
+        140
+      ],
+      "alwaysOutputData": true,
+      "notes": "screener-mcp-server: fetch/clone (tarball fallback when the image has no git), npm install with devDependencies forced on, then tsc. Prints BUILD_OK.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "command": "DIR=/home/node/.n8n/screener-mcp-server\nPORT=3123\nLOG=/home/node/.n8n/screener-mcp.log\nPROBE='{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}'\n\n# --- already listening? then do nothing (idempotent restart-safe) ---\nif wget -q -O /dev/null --timeout=3 \\\n     --header='Content-Type: application/json' \\\n     --header='Accept: application/json, text/event-stream' \\\n     --post-data=\"$PROBE\" \"http://127.0.0.1:$PORT/mcp\" 2>/dev/null; then\n  echo \"ALREADY_RUNNING port=$PORT\"\n  exit 0\nfi\n\ncd \"$DIR\"\n# Detach so the process outlives this node's execution. It still dies if the\n# n8n container restarts - that is what the 10-minute schedule is for.\nif command -v setsid >/dev/null 2>&1; then\n  TRANSPORT=http PORT=$PORT setsid node dist/index.js >> \"$LOG\" 2>&1 &\nelse\n  ( TRANSPORT=http PORT=$PORT nohup node dist/index.js >> \"$LOG\" 2>&1 & )\nfi\n\nsleep 3\necho \"STARTED port=$PORT log=$LOG\"\ntail -n 5 \"$LOG\" 2>/dev/null || true"
+      },
+      "id": "f1000000-0000-4000-8000-000000000005",
+      "name": "Start If Not Running",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        -300,
+        140
+      ],
+      "alwaysOutputData": true,
+      "notes": "Idempotent: probes tools/list first and exits ALREADY_RUNNING if the server is already listening on 3123, so a 5-minute tick does not spawn duplicates.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "amount": 5
+      },
+      "id": "f1000000-0000-4000-8000-000000000006",
+      "name": "Wait 5s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -80,
+        140
+      ],
+      "webhookId": "f1000000-0000-4000-8000-0000000000ff"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:3123/mcp",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json, text/event-stream"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "f1000000-0000-4000-8000-000000000007",
+      "name": "Health Check (tools/list)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        140,
+        140
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1000000-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.result?.tools?.length || 0 }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "f1000000-0000-4000-8000-000000000008",
+      "name": "Healthy?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        360,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "s1000000-0000-4000-8000-000000000001",
+              "name": "status",
+              "value": "healthy",
+              "type": "string"
+            },
+            {
+              "id": "s1000000-0000-4000-8000-000000000002",
+              "name": "endpoint",
+              "value": "http://127.0.0.1:3123/mcp",
+              "type": "string"
+            },
+            {
+              "id": "s1000000-0000-4000-8000-000000000003",
+              "name": "tools",
+              "value": "={{ $json.result.tools.map(t => t.name) }}",
+              "type": "array"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "f1000000-0000-4000-8000-000000000009",
+      "name": "Report Healthy",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        600,
+        40
+      ],
+      "notes": "MCP server confirmed up. Only from here does the scraper half run, so it can never query a dead endpoint.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "command": "tail -n 40 /home/node/.n8n/screener-mcp.log 2>/dev/null || echo 'no log file at /home/node/.n8n/screener-mcp.log'"
+      },
+      "id": "f1000000-0000-4000-8000-000000000010",
+      "name": "Dump Log On Failure",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        600,
+        380
+      ],
+      "alwaysOutputData": true,
+      "notes": "MCP server never came up - the scraper half is skipped entirely this tick.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "command": "set -e\nDIR=/home/node/.n8n/cron_scrapper\nREPO=https://github.com/Tengenisu/cron_scrapper.git\nBRANCH=main\nTARBALL=https://codeload.github.com/Tengenisu/cron_scrapper/tar.gz/refs/heads/main\n\n# --- auth ---\n# This repo is private: anonymous requests to both the API and codeload get a\n# 404, and git would then block forever on a username prompt. Fail fast instead,\n# and pass GITHUB_TOKEN per command so it never lands in .git/config on the\n# n8n volume. Set it in docker-compose (environment: - GITHUB_TOKEN=ghp_...).\nexport GIT_TERMINAL_PROMPT=0\nexport GIT_ASKPASS=/bin/true\nif [ -n \"$GITHUB_TOKEN\" ]; then\n  B64=$(printf 'x-access-token:%s' \"$GITHUB_TOKEN\" | base64 | tr -d '\\n')\n  echo 'auth: using GITHUB_TOKEN'\nelse\n  B64=''\n  echo 'auth: none (repo must be public)'\nfi\ngit_run() {\n  if [ -n \"$B64\" ]; then\n    git -c http.extraHeader=\"Authorization: Basic $B64\" \"$@\"\n  else\n    git \"$@\"\n  fi\n}\n\n# --- fetch or update the repo (git if present, tarball fallback) ---\n# fetch + reset --hard, NOT pull --ff-only: a shallow clone with no upstream\n# tracking makes pull die with \"Cannot fast-forward to multiple branches\", and\n# with a trailing \"|| true\" that failure is silent - the container then quietly\n# runs a stale checkout forever. This form always lands exactly on origin/main,\n# and says out loud which commit it is running.\nif [ -d \"$DIR/.git\" ]; then\n  if git_run -C \"$DIR\" fetch --depth 1 origin \"$BRANCH\" && git_run -C \"$DIR\" reset --hard \"origin/$BRANCH\"; then\n    echo \"SYNC_OK $(git -C \"$DIR\" rev-parse --short HEAD) on $BRANCH\"\n  else\n    echo \"SYNC_WARN: could not update $DIR - running whatever is already checked out\"\n  fi\nelif command -v git >/dev/null 2>&1; then\n  git_run clone --depth 1 --branch \"$BRANCH\" \"$REPO\" \"$DIR\"\nelse\n  echo 'git not found in container, falling back to tarball'\n  mkdir -p \"$DIR\"\n  if [ -n \"$B64\" ]; then\n    wget -qO- --header=\"Authorization: Basic $B64\" \"$TARBALL\" | tar xz --strip-components=1 -C \"$DIR\"\n  else\n    wget -qO- \"$TARBALL\" | tar xz --strip-components=1 -C \"$DIR\"\n  fi\nfi\n\ncd \"$DIR\"\n\n# --- install deps INCLUDING devDependencies ---\n# The n8n image sets NODE_ENV=production, which makes npm skip devDeps and\n# leaves typescript missing, so the build would fail. Force it here.\nif [ -f package-lock.json ]; then\n  NODE_ENV=development npm ci --include=dev --no-audit --no-fund \\\n    || NODE_ENV=development npm install --include=dev --no-audit --no-fund\nelse\n  NODE_ENV=development npm install --include=dev --no-audit --no-fund\nfi\n\n# --- build (call tsc directly, same as the supervisor does) ---\n./node_modules/.bin/tsc -p tsconfig.json\n\ntest -f dist/index.js || { echo 'BUILD_FAILED: dist/index.js missing'; exit 1; }\necho \"BUILD_OK node=$(node -v) dir=$DIR\""
+      },
+      "id": "f1000000-0000-4000-8000-000000000011",
+      "name": "Build Scraper",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        860,
+        40
+      ],
+      "notes": "cron_scrapper: fetch + reset --hard onto origin/main (private repo - set GITHUB_TOKEN in docker-compose; tarball fallback when the image has no git), npm install with devDependencies forced on, then tsc. Prints SYNC_OK <sha> so you can see which commit is actually running.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "command": "DIR=/home/node/.n8n/cron_scrapper\nOUT=/tmp/earnings-scraper.out\nERR=/tmp/earnings-scraper.err\n\n# Hard ceiling on this node, so it can never run into the next tick. The scraper\n# has its own RUN_DEADLINE_MS (4 min) and normally returns a partial snapshot\n# well before this fires; if it doesn't, the process is killed.\nLIMIT=${SCRAPER_TIMEOUT:-330}\n\n# Always exit 0 with exactly one JSON document on stdout - the next node has to\n# have something parseable no matter what went wrong here.\nfail() { printf '{\"ok\":false,\"error\":\"%s\"}\\n' \"$1\"; exit 0; }\n\ncd \"$DIR\" 2>/dev/null || fail \"cron_scrapper is not checked out - the build step failed\"\ntest -f dist/index.js || fail \"dist/index.js missing - the build step failed\"\n\n# TESTING MODE: nothing is cached, so every tick regenerates its data.\nexport CACHE_ENABLED=0\nexport MCP_ENDPOINT=http://127.0.0.1:3123/mcp\nexport DATA_DIR=\"$DIR/data\"\nexport RUN_DEADLINE_MS=240000\nexport LOG_LEVEL=info\n\nif command -v timeout >/dev/null 2>&1; then\n  timeout -k 10 \"$LIMIT\" node dist/index.js --once > \"$OUT\" 2> \"$ERR\"\nelse\n  node dist/index.js --once > \"$OUT\" 2> \"$ERR\"\nfi\nRC=$?\n\n# The log tail is what tells you WHERE a slow pass went - always surface it.\ntail -n 60 \"$ERR\" >&2\n\nif [ \"$RC\" = \"124\" ] || [ \"$RC\" = \"137\" ]; then\n  fail \"scraper hit the ${LIMIT}s hard timeout - the MCP server is slow or down\"\nfi\ntest -s \"$OUT\" || fail \"scraper printed nothing (exit $RC) - see the log above\"\n\ncat \"$OUT\""
+      },
+      "id": "f1000000-0000-4000-8000-000000000012",
+      "name": "Run Scraper",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        40
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "node dist/index.js --once: scrape Moneycontrol, resolve NSE symbols, dump each one from the MCP server, print one JSON document. A cold pass takes ~2.5 min; RUN_DEADLINE_MS caps the MCP step at 4 min (symbols not reached come back as mcpStatus 'pending') and `timeout` kills the process at 330s, so this node can never run into the next tick.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Execute Command hands us { exitCode, stdout, stderr }. The scraper prints\n// exactly one JSON document on stdout - a snapshot, a skipped tick, or\n// {\"ok\": false, ...} - so anything unparseable here is a container problem\n// (no node, a half-finished checkout), not a scraping problem.\nconst out = [];\n\nfor (const item of $input.all()) {\n  const stdout = String(item.json.stdout ?? '').trim();\n  const stderr = String(item.json.stderr ?? '').trim();\n  const exitCode = item.json.exitCode ?? 0;\n\n  if (!stdout) {\n    out.push({ json: { ok: false, error: `scraper printed nothing (exit ${exitCode})`, stderr: stderr.slice(-2000) } });\n    continue;\n  }\n\n  // Ignore anything npm or the shell may have printed before the document.\n  const start = stdout.indexOf('{');\n  try {\n    const doc = JSON.parse(start > 0 ? stdout.slice(start) : stdout);\n    doc.exitCode = exitCode;\n    if (stderr) doc.log = stderr.slice(-2000);\n    out.push({ json: doc });\n  } catch (err) {\n    out.push({\n      json: {\n        ok: false,\n        error: `unparseable scraper output: ${err.message}`,\n        stdout: stdout.slice(0, 2000),\n        stderr: stderr.slice(-2000),\n      },\n    });\n  }\n}\n\nreturn out;"
+      },
+      "id": "f1000000-0000-4000-8000-000000000013",
+      "name": "Parse Scraper JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        40
+      ],
+      "notes": "stdout -> JSON, with the tail of stderr kept under `log` for debugging."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d1000000-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.ok === true && $json.skipped !== true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "f1000000-0000-4000-8000-000000000014",
+      "name": "Fresh Data?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1520,
+        40
+      ],
+      "notes": "A real snapshot goes left; a skipped tick or an error goes right."
+    },
+    {
+      "parameters": {
+        "jsCode": "// One item per company, each carrying its own MCP dump under `mcp`.\n// No dedup: this is the full current snapshot every run, so decide downstream\n// what counts as new (compare nseSymbol + resultType against what you stored).\nconst out = [];\n\nfor (const item of $input.all()) {\n  const doc = item.json;\n  const base = {\n    ok: true,\n    runId: doc.runId ?? null,\n    source: doc.source ?? null,\n    scrapedAt: doc.scrapedAt ?? null,\n    calendarDate: doc.calendarDate ?? null,\n    cacheEnabled: doc.cacheEnabled ?? false,\n    truncated: doc.truncated ?? false,\n  };\n\n  const dumps = new Map((doc.mcp ?? []).map((dump) => [dump.symbol, dump]));\n  const rows = [\n    ...(doc.resultCalendar ?? []).map((record) => ({ section: 'resultCalendar', record })),\n    ...(doc.rapidResults ?? []).map((record) => ({ section: 'rapidResults', record })),\n  ];\n\n  for (const { section, record } of rows) {\n    const symbol = record.nseSymbol ?? null;\n    const dump = symbol ? dumps.get(symbol) : undefined;\n\n    // pending = the run deadline was reached before this symbol was dumped;\n    // the next tick picks it up. It is not a failure.\n    let mcpStatus = 'no-nse-symbol';\n    if (symbol) {\n      if (!dump) mcpStatus = 'missing';\n      else if (dump.pending) mcpStatus = 'pending';\n      else mcpStatus = dump.ok ? 'done' : 'failed';\n    }\n\n    out.push({\n      json: {\n        ...base,\n        section,\n        company: record.company ?? null,\n        scId: record.scId ?? null,\n        nseSymbol: symbol,\n        exchange: record.exchange ?? null,\n        ltp: record.ltp ?? null,\n        changePercent: record.changePercent ?? null,\n        resultType: record.resultType ?? record.period ?? null,\n        record,\n        mcpStatus,\n        mcpError: dump && !dump.ok ? dump.error ?? null : null,\n        mcpCounts: dump?.data?.counts ?? null,\n        mcp: dump ?? null,\n      },\n    });\n  }\n}\n\nreturn out.length > 0\n  ? out\n  : [{ json: { ok: true, skipped: true, reason: 'no companies listed on the page right now' } }];"
+      },
+      "id": "f1000000-0000-4000-8000-000000000015",
+      "name": "Split Into Companies",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        -80
+      ],
+      "notes": "One item per company, each carrying its own MCP dump under `mcp` and an mcpStatus of done / pending / failed / no-nse-symbol.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "e1000000-0000-4000-8000-000000000001",
+              "name": "status",
+              "value": "={{ $json.skipped ? 'skipped' : 'failed' }}",
+              "type": "string"
+            },
+            {
+              "id": "e1000000-0000-4000-8000-000000000002",
+              "name": "reason",
+              "value": "={{ $json.reason || $json.error || 'unknown' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "f1000000-0000-4000-8000-000000000016",
+      "name": "Skipped Or Failed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1760,
+        200
+      ],
+      "notes": "An overlapping tick ({\"ok\": true, \"skipped\": true}) is normal, not an error. A build failure, a scrape failure or the hard timeout lands here too.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build MCP Server",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 5 minutes": {
+      "main": [
+        [
+          {
+            "node": "Build MCP Server",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Called By Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Build MCP Server",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build MCP Server": {
+      "main": [
+        [
+          {
+            "node": "Start If Not Running",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start If Not Running": {
+      "main": [
+        [
+          {
+            "node": "Wait 5s",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 5s": {
+      "main": [
+        [
+          {
+            "node": "Health Check (tools/list)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Health Check (tools/list)": {
+      "main": [
+        [
+          {
+            "node": "Healthy?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Healthy?": {
+      "main": [
+        [
+          {
+            "node": "Report Healthy",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dump Log On Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Report Healthy": {
+      "main": [
+        [
+          {
+            "node": "Build Scraper",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Scraper": {
+      "main": [
+        [
+          {
+            "node": "Run Scraper",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Scraper": {
+      "main": [
+        [
+          {
+            "node": "Parse Scraper JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Scraper JSON": {
+      "main": [
+        [
+          {
+            "node": "Fresh Data?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fresh Data?": {
+      "main": [
+        [
+          {
+            "node": "Split Into Companies",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skipped Or Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "executionTimeout": 900
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "screener-mcp-earnings-supervisor"
+  },
+  "tags": []
+}

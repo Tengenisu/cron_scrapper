@@ -55,8 +55,16 @@ overlapping tick exits immediately with
 {"ok": true, "skipped": true, "reason": "run already in progress"}
 ```
 
-A lock older than `LOCK_STALE_MS` (default 900000) is treated as a crashed run
-and stolen. `--no-lock` bypasses the whole mechanism.
+The lock records the owning pid, so a run that was killed — a cancelled n8n
+execution, `timeout` firing, the container stopping — does not block anything:
+the next tick sees a dead pid and steals the file on the spot. It is also
+removed on `exit`/`SIGINT`/`SIGTERM`, and stolen outright once older than
+`LOCK_STALE_MS` (the run deadline plus 90s) for the one case a pid check can't
+see. `--no-lock` bypasses the whole mechanism.
+
+> If every tick returns `{"ok": true, "skipped": true}` and nothing ever runs,
+> that is an orphaned lock — versions before this behaviour blocked for a full
+> 15 minutes after any killed run. Deleting `.scraper.lock` clears it by hand.
 
 ## Setup
 
@@ -234,8 +242,13 @@ CACHE_ENABLED=0
 `run_every.ps1` is there for a host that wants PowerShell (or Task Scheduler) to
 own the loop instead.
 
-`SIGINT`/`SIGTERM` (`SIGINT`/`SIGBREAK` on Windows) stop the scheduler and wait
-for an in-flight pass to finish, so `data/` is never left half-written.
+`SIGINT`/`SIGTERM` (`SIGINT`/`SIGBREAK` on Windows) stop the scheduler: between
+ticks it shuts down cleanly, and during a pass the run is cut short and its lock
+released rather than left behind. Snapshots are written to a `.tmp` file and
+renamed, so an interrupted run can't leave a half-written document either way.
+
+Windows can't deliver `SIGTERM` to a Node process at all — a killed run there
+leaves its lock file, and the next run steals it on the dead-pid check.
 
 ## Configuration
 
@@ -255,7 +268,7 @@ name. The ones worth knowing:
 | `DATA_DIR` | `./data` | where snapshots are written |
 | `KEEP_RUNS` | `50` | snapshots kept under `data/runs/` (0 = keep all) |
 | `WRITE_DATA_FILES` | `1` | set to `0` for stdout-only runs |
-| `LOCK_STALE_MS` | `900000` | age at which a lock is assumed to be a crashed run |
+| `LOCK_STALE_MS` | `RUN_DEADLINE_MS + 90000` | backstop age at which a lock is stolen (a dead pid is stolen at once) |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
 
 ## n8n
@@ -312,6 +325,14 @@ cold, rate-limited by screener.in, or blocked by NSE from inside the container.
 If you see `run deadline reached — N symbol(s) left partial or undumped`, either
 the endpoint is unhealthy or `RUN_DEADLINE_MS` needs raising along with the
 cadence.
+
+If instead every execution ends at **Skipped Or Failed** with
+`run already in progress`, a previous run was killed and left its lock behind.
+The next tick now steals it automatically (dead pid); to clear one by hand:
+
+```bash
+docker exec <n8n-container> rm -f /home/node/.n8n/cron_scrapper/.scraper.lock
+```
 
 ### This repo is private — the build step needs a token
 

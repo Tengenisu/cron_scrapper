@@ -35,7 +35,7 @@ import urllib.error
 import urllib.request
 
 import config
-from md_to_json import markdown_to_dict
+from md_to_json import dump_to_dict
 
 log = logging.getLogger("earnings")
 
@@ -91,13 +91,18 @@ def extract_next_data(html: str) -> dict:
 # NSE symbol resolution
 # --------------------------------------------------------------------------- #
 class SymbolResolver:
-    """scId -> NSE symbol, backed by a JSON file cache."""
+    """scId -> NSE symbol, backed by a JSON file cache.
 
-    def __init__(self, cache_path: str):
-        self.cache_path = cache_path
+    With ``enabled=False`` (the default in testing mode) nothing is remembered
+    and nothing is written: every scId is looked up live on every run.
+    """
+
+    def __init__(self, cache_path: str, enabled: bool = True):
+        self.enabled = bool(enabled and cache_path)
+        self.cache_path = cache_path if self.enabled else ""
         self.cache: dict[str, str | None] = {}
         self._dirty = False
-        if cache_path and os.path.exists(cache_path):
+        if self.enabled and os.path.exists(cache_path):
             try:
                 with open(cache_path, encoding="utf-8") as fh:
                     self.cache = json.load(fh)
@@ -107,7 +112,7 @@ class SymbolResolver:
     def resolve(self, sc_id: str | None, exchange: str = "N") -> str | None:
         if not sc_id:
             return None
-        if sc_id in self.cache:
+        if self.enabled and sc_id in self.cache:
             return self.cache[sc_id]
 
         symbol = None
@@ -131,12 +136,13 @@ class SymbolResolver:
 
         if symbol is None:
             log.info("no NSE symbol for scId=%s (exchange=%s)", sc_id, exchange)
-        self.cache[sc_id] = symbol
-        self._dirty = True
+        if self.enabled:
+            self.cache[sc_id] = symbol
+            self._dirty = True
         return symbol
 
     def save(self) -> None:
-        if not (self._dirty and self.cache_path):
+        if not (self.enabled and self._dirty):
             return
         # Only successful lookups are persisted: a BSE-only scrip may get listed
         # on the NSE later, and a cached null would hide it forever.
@@ -237,6 +243,7 @@ def run_node_query(symbol: str) -> dict | None:
         return None
 
     command = config.NODE_CMD.replace("{symbol}", symbol)
+    env = dict(os.environ, MCP_ENDPOINT=config.MCP_ENDPOINT, SYMBOL=symbol)
     log.info("node query for %s", symbol)
     try:
         proc = subprocess.run(
@@ -246,6 +253,7 @@ def run_node_query(symbol: str) -> dict | None:
             text=True,
             timeout=config.NODE_TIMEOUT,
             cwd=config.NODE_CWD,
+            env=env,
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
         log.error("node query failed for %s: %s", symbol, exc)
@@ -260,20 +268,85 @@ def run_node_query(symbol: str) -> dict | None:
             "error": (proc.stderr or "").strip()[:2000],
         }
 
-    return {"symbol": symbol, "ok": True, "data": markdown_to_dict(proc.stdout)}
+    return {"symbol": symbol, "ok": True, "data": dump_to_dict(proc.stdout)}
+
+
+# --------------------------------------------------------------------------- #
+# Run lock -- keeps 5-second ticks from stacking on top of each other
+# --------------------------------------------------------------------------- #
+class RunLock:
+    """Best-effort cross-platform single-run lock built on O_EXCL."""
+
+    def __init__(self, path: str, stale_after: float):
+        self.path = path
+        self.stale_after = stale_after
+        self.held = False
+
+    def acquire(self) -> bool:
+        if not self.path:
+            return True
+        for _ in range(2):
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if not self._steal_if_stale():
+                    return False
+                continue
+            except OSError as exc:
+                log.warning("cannot create lock %s: %s", self.path, exc)
+                return True
+            with os.fdopen(fd, "w") as fh:
+                fh.write("{} {}".format(os.getpid(), time.time()))
+            self.held = True
+            return True
+        return False
+
+    def _steal_if_stale(self) -> bool:
+        try:
+            age = time.time() - os.path.getmtime(self.path)
+        except OSError:
+            return True  # vanished between calls -- retry the create
+        if age < self.stale_after:
+            return False
+        log.warning("stealing stale lock %s (%.0fs old)", self.path, age)
+        try:
+            os.unlink(self.path)
+        except OSError:
+            return False
+        return True
+
+    def release(self) -> None:
+        if not self.held:
+            return
+        try:
+            os.unlink(self.path)
+        except OSError as exc:
+            log.warning("could not remove lock %s: %s", self.path, exc)
+        self.held = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
 
 
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
 def scrape(sections: str = "both", enrich: bool = True) -> dict:
-    html = http_get(config.EARNINGS_URL)
+    url = config.EARNINGS_URL
+    if not config.CACHE_ENABLED:
+        # defeat any CDN/proxy copy so each run really re-reads the page
+        url += ("&" if "?" in url else "?") + "_=%d" % time.time()
+    html = http_get(url)
     next_data = extract_next_data(html)
     earnings = next_data["props"]["pageProps"]["earningsDashboardData"]
 
     result: dict = {
         "ok": True,
         "source": config.EARNINGS_URL,
+        "cacheEnabled": config.CACHE_ENABLED,
         "scrapedAt": dt.datetime.now(dt.timezone.utc).astimezone().isoformat(),
         "calendarDate": earnings.get("resCalTodayDate"),
         "calendarRange": {
@@ -290,7 +363,7 @@ def scrape(sections: str = "both", enrich: bool = True) -> dict:
         result["rapidResults"] = parse_rapid_results(earnings)
 
     records = result["resultCalendar"] + result["rapidResults"]
-    resolver = SymbolResolver(config.SYMBOL_CACHE)
+    resolver = SymbolResolver(config.SYMBOL_CACHE, enabled=config.CACHE_ENABLED)
     for record in records:
         record["nseSymbol"] = resolver.resolve(record.get("scId"), record.get("exchange") or "N")
     resolver.save()
@@ -320,7 +393,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", help="also write the JSON to this file")
     parser.add_argument("--pretty", action="store_true", help="indent the JSON output")
     parser.add_argument("--symbols-only", action="store_true", help="print just the NSE symbols, one per line")
+    parser.add_argument("--no-lock", action="store_true", help="run even if another run is in flight")
     args = parser.parse_args(argv)
+
+    # the MCP dump carries rupee signs and em dashes; never die on a cp1252 console
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
     logging.basicConfig(
         level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
@@ -328,12 +409,22 @@ def main(argv: list[str] | None = None) -> int:
         stream=sys.stderr,
     )
 
+    lock = RunLock("" if args.no_lock else config.LOCK_FILE, config.LOCK_STALE_SECONDS)
+    if not lock.acquire():
+        # A 5-second tick landed while the previous pass is still running. This
+        # is expected, not an error: n8n should treat it as "nothing new".
+        log.info("another run is in flight -- skipping this tick")
+        print(json.dumps({"ok": True, "skipped": True, "reason": "run already in progress"}))
+        return 0
+
     try:
         data = scrape(sections=args.section, enrich=not args.no_node)
     except Exception as exc:  # cron/n8n needs parseable failure, not a traceback
         log.exception("scrape failed")
         print(json.dumps({"ok": False, "error": str(exc)}))
         return 1
+    finally:
+        lock.release()
 
     if args.symbols_only:
         for symbol in data["nseSymbols"]:

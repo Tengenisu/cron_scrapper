@@ -1,0 +1,274 @@
+{
+  "name": "moneycontrol earnings :: scraper (5s, no cache)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "b1000000-0000-4000-8000-000000000001",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -680,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "b1000000-0000-4000-8000-000000000002",
+      "name": "Every 5 seconds",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -680,
+        160
+      ],
+      "notes": "TESTING MODE. A full pass takes minutes; overlapping ticks are dropped by the lock in scraper.py."
+    },
+    {
+      "parameters": {},
+      "id": "b1000000-0000-4000-8000-000000000003",
+      "name": "Called By Supervisor",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        -680,
+        360
+      ],
+      "notes": "Entry point used by 'screener-mcp :: supervisor' once the MCP server reports healthy."
+    },
+    {
+      "parameters": {
+        "command": "set -e\nDIR=/home/node/.n8n/cron_scrapper\nREPO=https://github.com/Tengenisu/cron_scrapper.git\nTARBALL=https://codeload.github.com/Tengenisu/cron_scrapper/tar.gz/refs/heads/main\n\n# --- fetch or update the repo (git if present, tarball fallback) ---\nif [ -d \"$DIR/.git\" ]; then\n  git -C \"$DIR\" pull --ff-only || true\nelif command -v git >/dev/null 2>&1; then\n  git clone --depth 1 \"$REPO\" \"$DIR\"\nelse\n  echo 'git not found in container, falling back to tarball'\n  mkdir -p \"$DIR\"\n  wget -qO- \"$TARBALL\" | tar xz --strip-components=1 -C \"$DIR\"\nfi\n\ntest -f \"$DIR/scraper.py\" || { echo 'SYNC_FAILED: scraper.py missing'; exit 1; }\n\n# --- the n8n image ships node but NOT python: say so here, loudly ---\n# scraper.py is stdlib-only, so any python3 >= 3.9 will do.\nPY=\"$(command -v python3 || command -v python || true)\"\nif [ -z \"$PY\" ]; then\n  echo 'SYNC_WARN: no python interpreter in this container -- Run Scraper cannot work.'\n  echo '  fix with:  docker exec -u root <n8n-container> apk add --no-cache python3'\n  echo '  or bake python3 into a custom n8n image, or run scraper.py on the host.'\nelse\n  echo \"python=$(\"$PY\" -V 2>&1) at $PY\"\nfi\n\necho \"SYNC_OK dir=$DIR node=$(node -v)\"\n"
+      },
+      "id": "b1000000-0000-4000-8000-000000000004",
+      "name": "Sync Scraper Repo",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        -420,
+        160
+      ],
+      "alwaysOutputData": true,
+      "notes": "Idempotent clone/pull, mirroring the supervisor's build step. Also checks for a python interpreter -- the n8n image ships node but not python3."
+    },
+    {
+      "parameters": {
+        "command": "DIR=/home/node/.n8n/cron_scrapper\ncd \"$DIR\"\n\n# The n8n image has no python by default. Fail as one parseable JSON document\n# rather than as an empty stdout the parser cannot explain.\nPY=\"$(command -v python3 || command -v python || true)\"\nif [ -z \"$PY\" ]; then\n  echo '{\"ok\":false,\"error\":\"no python interpreter in the n8n container -- see the Sync Scraper Repo output\"}'\n  exit 0\nfi\n\n# TESTING MODE: caching is off, so every run re-resolves symbols and re-queries\n# the MCP server. A tick that overlaps a run in flight exits with skipped:true.\nCACHE_ENABLED=0 \\\nMCP_ENDPOINT=http://127.0.0.1:3123/mcp \\\nLOG_LEVEL=INFO \\\n\"$PY\" scraper.py\n"
+      },
+      "id": "b1000000-0000-4000-8000-000000000005",
+      "name": "Run Scraper",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        -180,
+        160
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "scraper.py always prints one JSON document on stdout, including on failure and when python is missing."
+    },
+    {
+      "parameters": {
+        "jsCode": "// scraper.py prints exactly one JSON document on stdout -- success, failure or\n// skipped tick. Anything else means the command itself broke.\nconst out = [];\n\nfor (const item of $input.all()) {\n  const stdout = (item.json.stdout || '').trim();\n  const stderr = (item.json.stderr || '').trim();\n\n  let parsed;\n  try {\n    parsed = JSON.parse(stdout.slice(stdout.indexOf('{')));\n  } catch (e) {\n    out.push({ json: { ok: false, skipped: false, error: 'unparseable scraper output: ' + e.message, stdout: stdout.slice(0, 2000), stderrTail: stderr.slice(-2000) } });\n    continue;\n  }\n\n  parsed.skipped = parsed.skipped === true;\n  parsed.stderrTail = stderr.slice(-2000);\n  out.push({ json: parsed });\n}\n\nreturn out;"
+      },
+      "id": "b1000000-0000-4000-8000-000000000006",
+      "name": "Parse Scraper JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        60,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d1000000-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.ok === true && $json.skipped !== true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "b1000000-0000-4000-8000-000000000007",
+      "name": "Fresh Data?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        300,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// One item per company, each carrying its own MCP dump. No dedup by design:\n// every run emits the full current snapshot so downstream nodes can diff.\nconst out = [];\n\nfor (const item of $input.all()) {\n  const d = item.json;\n  const bySymbol = Object.fromEntries((d.mcp || []).map(m => [m.symbol, m]));\n\n  const rows = [\n    ...(d.resultCalendar || []).map(r => ({ ...r, section: 'resultCalendar' })),\n    ...(d.rapidResults || []).map(r => ({ ...r, section: 'rapidResults' })),\n  ];\n\n  for (const row of rows) {\n    const mcp = row.nseSymbol ? bySymbol[row.nseSymbol] : undefined;\n    out.push({\n      json: {\n        scrapedAt: d.scrapedAt,\n        calendarDate: d.calendarDate,\n        cacheEnabled: d.cacheEnabled,\n        section: row.section,\n        company: row.company,\n        scId: row.scId,\n        nseSymbol: row.nseSymbol || null,\n        exchange: row.exchange,\n        ltp: row.ltp,\n        changePercent: row.changePercent,\n        resultType: row.resultType || row.period || null,\n        record: row,\n        mcpOk: mcp ? mcp.ok : null,\n        mcpCounts: mcp && mcp.data ? mcp.data.counts : null,\n        mcp: mcp || null,\n      },\n    });\n  }\n}\n\nreturn out;"
+      },
+      "id": "b1000000-0000-4000-8000-000000000008",
+      "name": "Split Into Companies",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "e1000000-0000-4000-8000-000000000001",
+              "name": "status",
+              "value": "={{ $json.skipped ? 'skipped' : 'failed' }}",
+              "type": "string"
+            },
+            {
+              "id": "e1000000-0000-4000-8000-000000000002",
+              "name": "reason",
+              "value": "={{ $json.reason || $json.error || 'unknown' }}",
+              "type": "string"
+            },
+            {
+              "id": "e1000000-0000-4000-8000-000000000003",
+              "name": "stderrTail",
+              "value": "={{ $json.stderrTail || '' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "b1000000-0000-4000-8000-000000000009",
+      "name": "Skipped Or Failed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        560,
+        300
+      ],
+      "notes": "A skipped tick is normal at a 5-second cadence: the previous pass is still running."
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Sync Scraper Repo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 5 seconds": {
+      "main": [
+        [
+          {
+            "node": "Sync Scraper Repo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Called By Supervisor": {
+      "main": [
+        [
+          {
+            "node": "Sync Scraper Repo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sync Scraper Repo": {
+      "main": [
+        [
+          {
+            "node": "Run Scraper",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Scraper": {
+      "main": [
+        [
+          {
+            "node": "Parse Scraper JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Scraper JSON": {
+      "main": [
+        [
+          {
+            "node": "Fresh Data?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fresh Data?": {
+      "main": [
+        [
+          {
+            "node": "Split Into Companies",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skipped Or Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "executionTimeout": 900
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "moneycontrol-earnings-scraper"
+  },
+  "tags": []
+}

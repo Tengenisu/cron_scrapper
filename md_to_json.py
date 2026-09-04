@@ -56,7 +56,7 @@ def _is_table_row(line: str) -> bool:
 def _coerce(value: str):
     """Turn obviously numeric cells into numbers, keep everything else as text."""
     v = value.strip()
-    if v in {"", "-", "--", "N/A", "NA", "null", "None"}:
+    if v in {"", "-", "--", "—", "–", "N/A", "NA", "null", "None"}:
         return None
     low = v.lower()
     if low in {"true", "false"}:
@@ -175,4 +175,91 @@ def markdown_to_dict(markdown: str) -> dict:
         "fields": merged_fields,
         "tables": all_tables,
         "raw": markdown,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# The full-dump document produced by mcp_query.js
+#
+# It is a flat concatenation of one block per MCP tool call, each introduced by
+#     ## <LABEL>   [<tool_name>]
+# so the dump is split on those job headers first and each body is then parsed
+# as its own little Markdown document.
+# --------------------------------------------------------------------------- #
+_JOB_HEADER = re.compile(r"^##\s+(.*?)\s{2,}\[([A-Za-z0-9_]+)\]\s*$")
+_DUMP_TITLE = re.compile(r"^FULL DUMP\s*\|\s*(\S+)\s*\|\s*(\S+)\s*$")
+_RULE = re.compile(r"^[-=]{10,}$")
+
+_FAILURE_PREFIXES = ("REQUEST FAILED:", "RPC ERROR:", "Error:")
+_EMPTY_MARKERS = ("No corporate actions found", "Not enough price history", "No data")
+
+
+def _classify(body: str) -> tuple[bool, str | None, bool]:
+    """Return (ok, error, empty) for one job body."""
+    head = body.lstrip()
+    for prefix in _FAILURE_PREFIXES:
+        if head.startswith(prefix):
+            return False, head.splitlines()[0].strip(), False
+    if any(head.startswith(m) for m in _EMPTY_MARKERS):
+        return True, None, True
+    return True, None, not head
+
+
+def dump_to_dict(dump: str) -> dict:
+    """Parse the mcp_query.js dump into {symbol, generatedAt, jobs: [...]}."""
+    lines = (dump or "").replace("\r\n", "\n").split("\n")
+
+    symbol = generated_at = None
+    jobs: list[dict] = []
+    current: dict | None = None
+    buf: list[str] = []
+
+    def close() -> None:
+        nonlocal current
+        if current is None:
+            return
+        body = "\n".join(buf).strip()
+        ok, error, empty = _classify(body)
+        current.update({"ok": ok, "error": error, "empty": empty})
+        if ok and not empty:
+            stripped = body.lstrip()
+            if stripped[:1] in "{[":
+                try:
+                    current["data"] = json.loads(stripped)
+                except ValueError:
+                    current["content"] = markdown_to_dict(body)
+            else:
+                current["content"] = markdown_to_dict(body)
+        current["raw"] = body
+        jobs.append(current)
+        current = None
+        buf.clear()
+
+    for line in lines:
+        title = _DUMP_TITLE.match(line.strip())
+        if title and current is None:
+            symbol, generated_at = title.group(1), title.group(2)
+            continue
+        header = _JOB_HEADER.match(line)
+        if header:
+            close()
+            current = {"label": header.group(1).strip(), "tool": header.group(2)}
+            continue
+        if _RULE.match(line.strip()):
+            continue
+        if current is not None:
+            buf.append(line)
+
+    close()
+
+    return {
+        "symbol": symbol,
+        "generatedAt": generated_at,
+        "jobs": jobs,
+        "counts": {
+            "total": len(jobs),
+            "ok": sum(1 for j in jobs if j["ok"]),
+            "failed": sum(1 for j in jobs if not j["ok"]),
+            "empty": sum(1 for j in jobs if j.get("empty")),
+        },
     }

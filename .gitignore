@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# testing mode writes no cache, but a run still leaves these behind
+.scraper.lock
+symbol_cache.json
+out.jsonl
+err.log

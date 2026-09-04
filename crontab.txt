@@ -1,18 +1,30 @@
-# Moneycontrol earnings scraper schedule (IST).
-# Every 30 minutes from 09:00 to 15:30, and again from 15:30 through 01:00 next day.
+# Moneycontrol earnings scraper schedule.
+#
+# TESTING MODE: every 5 seconds, around the clock, with caching disabled so
+# every tick regenerates its data from scratch.
+#
+# cron cannot express sub-minute schedules, so cron fires run_every.sh once a
+# minute and that script loops through the minute at a 5-second cadence. A tick
+# that lands while the previous pass is still running (a full pass over ~8
+# symbols takes a couple of minutes) is dropped by the lock in scraper.py and
+# prints {"ok": true, "skipped": true}, so nothing stacks up.
+#
 # Install with:  crontab crontab.txt      (check with: crontab -l)
 
 CRON_TZ=Asia/Kolkata
 SHELL=/bin/bash
 PATH=/usr/local/bin:/usr/bin:/bin
 
-# 09:00 -> 23:30
-0,30 9-23 * * *  cd /opt/cron_scrapper && /usr/bin/python3 scraper.py >> /var/log/earnings/out.jsonl 2>> /var/log/earnings/err.log
+RUN_INTERVAL_SECONDS=5
+CACHE_ENABLED=0
 
-# 00:00, 00:30 and the final 01:00 run
-0,30 0 * * *     cd /opt/cron_scrapper && /usr/bin/python3 scraper.py >> /var/log/earnings/out.jsonl 2>> /var/log/earnings/err.log
-0 1 * * *        cd /opt/cron_scrapper && /usr/bin/python3 scraper.py >> /var/log/earnings/out.jsonl 2>> /var/log/earnings/err.log
+* * * * *  cd /opt/cron_scrapper && ./run_every.sh >> /var/log/earnings/cron.log 2>&1
 
-# If n8n itself owns the schedule, use its Schedule Trigger with the same cron
-# expressions and an Execute Command node running `python3 scraper.py` instead;
-# do not run both, or every symbol gets queried twice.
+# To go back to market-hours-only scanning, drop the line above and use:
+#   0,30 9-23 * * *  cd /opt/cron_scrapper && /usr/bin/python3 scraper.py >> /var/log/earnings/out.jsonl 2>> /var/log/earnings/err.log
+#   0,30 0    * * *  cd /opt/cron_scrapper && /usr/bin/python3 scraper.py >> /var/log/earnings/out.jsonl 2>> /var/log/earnings/err.log
+#   0    1    * * *  cd /opt/cron_scrapper && /usr/bin/python3 scraper.py >> /var/log/earnings/out.jsonl 2>> /var/log/earnings/err.log
+#
+# If n8n owns the schedule instead, use the Schedule Trigger in
+# n8n-workflows/moneycontrol-earnings-scraper.json (also 5 seconds) and do not
+# install this crontab, or every symbol gets queried twice.

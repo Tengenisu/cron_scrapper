@@ -32,7 +32,7 @@ Options:
   --section <both|calendar|rapid>   which section(s) to scrape (default: both)
   --no-mcp                          skip the MCP dump step (scrape only)
   --pretty                          indent the JSON output
-  --symbols-only                    print just the resolved NSE symbols, one per line
+  --symbols-only                    print just the resolved symbols, "SYMBOL	NSE" per line
   --out <file>                      also write the JSON document to this file
   --no-lock                         run even if another pass is in flight
   --quiet                           don't print the document (data/ is still written)
@@ -105,7 +105,11 @@ export function parseArgs(argv: string[]): CliOptions {
 
 function emit(result: RunResult, options: CliOptions): void {
   if (options.symbolsOnly) {
-    if ("nseSymbols" in result) for (const symbol of result.nseSymbols) console.log(symbol);
+    if ("results" in result) {
+      for (const stock of result.results) {
+        if (stock.symbol) console.log(`${stock.symbol}	${stock.exchange}`);
+      }
+    }
     return;
   }
 
@@ -136,9 +140,10 @@ async function runCronMode(options: CliOptions): Promise<number> {
     emit(result, tickOptions);
     if (!options.symbolsOnly && "counts" in result) {
       log.info(
-        `snapshot ${result.runId}: ${result.counts.nseSymbols} symbol(s), ` +
-          `${result.counts.mcpOk} dumped, ${result.counts.mcpFailed} failed, ` +
-          `${result.counts.mcpPending} pending${result.truncated ? " (deadline)" : ""}`
+        `snapshot ${result.runId}: ${result.counts.scanned} stock(s), ` +
+          `${result.counts.ok} dumped, ${result.counts.failed} failed, ` +
+          `${result.counts.unresolved} unresolved, ` +
+          `${result.counts.pending} pending${result.truncated ? " (deadline)" : ""}`
       );
     }
   });

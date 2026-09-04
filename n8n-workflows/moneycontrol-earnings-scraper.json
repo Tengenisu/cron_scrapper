@@ -75,7 +75,7 @@
         160
       ],
       "onError": "continueRegularOutput",
-      "notes": "node dist/index.js --once: scrape Moneycontrol, resolve NSE symbols, dump each one from the MCP server, print one JSON document. A cold pass takes ~2.5 min; RUN_DEADLINE_MS caps the MCP step at 4 min (symbols not reached come back as mcpStatus 'pending') and `timeout` kills the process at 330s, so this node can never run into the next tick.",
+      "notes": "node dist/index.js --once: scan Moneycontrol for stocks with results, resolve each to an NSE symbol or BSE code, dump that symbol from the MCP server, format it, print one JSON document. A cold pass takes ~2.5 min; RUN_DEADLINE_MS caps the MCP step at 4 min (stocks not reached come back with status 'pending') and `timeout` kills the process at 330s, so this node can never run into the next tick.",
       "notesInFlow": true
     },
     {
@@ -130,7 +130,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// One item per company, each carrying its own MCP dump under `mcp`.\n// No dedup: this is the full current snapshot every run, so decide downstream\n// what counts as new (compare nseSymbol + resultType against what you stored).\nconst out = [];\n\nfor (const item of $input.all()) {\n  const doc = item.json;\n  const base = {\n    ok: true,\n    runId: doc.runId ?? null,\n    source: doc.source ?? null,\n    scrapedAt: doc.scrapedAt ?? null,\n    calendarDate: doc.calendarDate ?? null,\n    cacheEnabled: doc.cacheEnabled ?? false,\n    truncated: doc.truncated ?? false,\n  };\n\n  const dumps = new Map((doc.mcp ?? []).map((dump) => [dump.symbol, dump]));\n  const rows = [\n    ...(doc.resultCalendar ?? []).map((record) => ({ section: 'resultCalendar', record })),\n    ...(doc.rapidResults ?? []).map((record) => ({ section: 'rapidResults', record })),\n  ];\n\n  for (const { section, record } of rows) {\n    const symbol = record.nseSymbol ?? null;\n    const dump = symbol ? dumps.get(symbol) : undefined;\n\n    // pending = the run deadline was reached before this symbol was dumped;\n    // the next tick picks it up. It is not a failure.\n    let mcpStatus = 'no-nse-symbol';\n    if (symbol) {\n      if (!dump) mcpStatus = 'missing';\n      else if (dump.pending) mcpStatus = 'pending';\n      else mcpStatus = dump.ok ? 'done' : 'failed';\n    }\n\n    out.push({\n      json: {\n        ...base,\n        section,\n        company: record.company ?? null,\n        scId: record.scId ?? null,\n        nseSymbol: symbol,\n        exchange: record.exchange ?? null,\n        ltp: record.ltp ?? null,\n        changePercent: record.changePercent ?? null,\n        resultType: record.resultType ?? record.period ?? null,\n        record,\n        mcpStatus,\n        mcpError: dump && !dump.ok ? dump.error ?? null : null,\n        mcpCounts: dump?.data?.counts ?? null,\n        mcp: dump ?? null,\n      },\n    });\n  }\n}\n\nreturn out.length > 0\n  ? out\n  : [{ json: { ok: true, skipped: true, reason: 'no companies listed on the page right now' } }];"
+        "jsCode": "// One item per stock. `doc.results` is already one entry per company, each\n// carrying its formatted MCP data under `data`, so this is a plain fan-out —\n// there is no scraped row left to match a dump back to.\n//\n// Everything under `data` came from the screener MCP server. Moneycontrol is\n// only the scan (which stocks, and what their symbol is); none of its own\n// numbers are in here.\n//\n// No dedup: this is the full current scan every run, so decide downstream what\n// counts as new.\nconst out = [];\n\nfor (const item of $input.all()) {\n  const doc = item.json;\n  const base = {\n    ok: true,\n    runId: doc.runId ?? null,\n    source: doc.source ?? null,\n    scrapedAt: doc.scrapedAt ?? null,\n    cacheEnabled: doc.cacheEnabled ?? false,\n    truncated: doc.truncated ?? false,\n  };\n\n  for (const stock of doc.results ?? []) {\n    out.push({\n      json: {\n        ...base,\n        company: stock.company ?? null,\n        // An NSE ticker (DHOOTTRANS) or, for a BSE-only scrip, its code (541735).\n        symbol: stock.symbol ?? null,\n        exchange: stock.exchange ?? null,\n        scId: stock.scId ?? null,\n        events: stock.events ?? [],\n        // ok | failed | pending | unresolved. pending = the run deadline arrived\n        // before this stock was dumped and the next tick picks it up, not a failure.\n        status: stock.status ?? null,\n        error: stock.error ?? null,\n        counts: stock.data?.counts ?? null,\n        issues: stock.data?.issues ?? [],\n        data: stock.data ?? null,\n      },\n    });\n  }\n}\n\nreturn out.length > 0\n  ? out\n  : [{ json: { ok: true, skipped: true, reason: 'no companies listed on the page right now' } }];"
       },
       "id": "b1000000-0000-4000-8000-000000000008",
       "name": "Split Into Companies",
@@ -140,7 +140,7 @@
         560,
         40
       ],
-      "notes": "One item per company, each carrying its own MCP dump under `mcp` and an mcpStatus of done / pending / failed / no-nse-symbol.",
+      "notes": "One item per stock, each carrying its formatted MCP data under `data` and a status of ok / pending / failed / unresolved. Nothing Moneycontrol reports about the company is included — it is the scan only.",
       "notesInFlow": true
     },
     {

@@ -14,7 +14,7 @@ export const CliOptionsSchema = z.object({
   /** Skip the MCP step entirely — scrape only. */
   enrich: z.boolean().default(true),
   pretty: z.boolean().default(false),
-  /** Print just the resolved NSE symbols, one per line. */
+  /** Print just the resolved symbols, one per line. */
   symbolsOnly: z.boolean().default(false),
   /** Run even if another pass is in flight. */
   useLock: z.boolean().default(true),
@@ -30,7 +30,7 @@ export type CliOptions = z.infer<typeof CliOptionsSchema>;
 
 /**
  * priceapi.moneycontrol.com/pricefeed/{nse|bse}/equitycash/{scId}.
- * Only NSEID matters here; everything else is passthrough noise.
+ * Only NSEID and BSEID matter here; everything else is passthrough noise.
  */
 export const PriceFeedResponseSchema = z.object({
   code: z.union([z.string(), z.number()]).optional(),

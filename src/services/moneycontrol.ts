@@ -1,13 +1,19 @@
 import { EARNINGS_URL } from "../constants.js";
 import { fetchText, ScraperRequestError } from "./http.js";
-import { toNumber, toText } from "./format.js";
+import { toText } from "./format.js";
 import { log } from "./log.js";
-import type { CalendarEntry, EarningsSections, QuarterMetric, RapidResult } from "../types.js";
+import type { ScrapedRow, SectionSelection } from "../types.js";
 
 /**
  * moneycontrol.com/markets/earnings is a Next.js app and both sections we want
  * are server-rendered into the `__NEXT_DATA__` blob — so no headless browser and
  * no DOM scraping of the rendered table: read the JSON the page shipped with.
+ *
+ * The page is used purely as a *scan*: which companies have results, and what
+ * Moneycontrol calls them. Its own numbers — price, change, market cap, its
+ * revenue/profit table — are deliberately not read: everything downstream comes
+ * from the MCP server, and carrying a second, differently-sourced copy of the
+ * same figures alongside it is how two answers to one question get shipped.
  *
  * If `__NEXT_DATA__ not found` starts appearing, Moneycontrol has changed the
  * page or is blocking the request. That is the one failure mode worth alerting on.
@@ -20,31 +26,8 @@ interface NextDataEnvelope {
 }
 
 interface EarningsDashboard {
-  resCalTodayDate?: string;
-  resCalFromDate?: string;
-  resCalToDate?: string;
-  resCalData?: { list?: RawCalendarRow[] };
-  rapResData?: {
-    baseURL?: string;
-    tableHeader?: string[];
-    header?: { name?: string }[];
-    list?: unknown[][];
-  };
-}
-
-interface RawCalendarRow {
-  date?: string;
-  stockName?: string;
-  stockShortName?: string;
-  scId?: string;
-  exchange?: string;
-  resultType?: string;
-  ltp?: string | number;
-  change?: string | number;
-  time?: string;
-  marketCap?: string | number;
-  stockUrl?: string;
-  seeFinancial?: string;
+  resCalData?: { list?: { stockName?: string; scId?: string; exchange?: string }[] };
+  rapResData?: { header?: { name?: string }[]; list?: unknown[][] };
 }
 
 /**
@@ -88,22 +71,12 @@ export async function fetchEarningsDashboard(): Promise<EarningsDashboard> {
 }
 
 /** RESULT CALENDAR — companies *about to* release quarterly numbers. */
-export function parseResultCalendar(dashboard: EarningsDashboard): CalendarEntry[] {
-  const rows = dashboard.resCalData?.list ?? [];
-  return rows.map((row) => ({
-    date: toText(row.date),
+export function parseResultCalendar(dashboard: EarningsDashboard): ScrapedRow[] {
+  return (dashboard.resCalData?.list ?? []).map((row) => ({
     company: toText(row.stockName),
-    shortName: toText(row.stockShortName),
     scId: toText(row.scId),
     exchange: toText(row.exchange),
-    resultType: toText(row.resultType),
-    ltp: toNumber(row.ltp),
-    changePercent: toNumber(row.change),
-    time: toText(row.time),
-    marketCap: toNumber(row.marketCap),
-    url: toText(row.stockUrl),
-    financialsUrl: toText(row.seeFinancial),
-    nseSymbol: null, // filled in by the symbol resolver
+    events: ["upcoming" as const],
   }));
 }
 
@@ -113,11 +86,9 @@ export function parseResultCalendar(dashboard: EarningsDashboard): CalendarEntry
  * The rows arrive as positional arrays; `header[].name` is the column order, so
  * the two are zipped back into objects before anything is read by name.
  */
-export function parseRapidResults(dashboard: EarningsDashboard): RapidResult[] {
+export function parseRapidResults(dashboard: EarningsDashboard): ScrapedRow[] {
   const block = dashboard.rapResData ?? {};
-  const baseUrl = block.baseURL ?? "";
   const names = (block.header ?? []).map((header) => header.name ?? "");
-  const columns = block.tableHeader ?? [];
 
   return (block.list ?? []).map((row) => {
     const record: Record<string, unknown> = {};
@@ -125,54 +96,43 @@ export function parseRapidResults(dashboard: EarningsDashboard): RapidResult[] {
       if (name) record[name] = row[index];
     });
 
-    const quarterData: QuarterMetric[] = (
-      Array.isArray(record["quarterData"]) ? (record["quarterData"] as unknown[]) : []
-    ).map((metric) => {
-      const cells = Array.isArray(metric) ? (metric as unknown[]) : [];
-      return {
-        metric: toText(cells[0]),
-        current: toNumber(cells[1]),
-        previous: toNumber(cells[2]),
-        growthPercent: toNumber(cells[3]),
-      };
-    });
-
-    const seo = toText(record["seoString"]);
     return {
-      date: toText(record["date"]),
       company: toText(record["stockName"]),
       scId: toText(record["scID"] ?? record["scId"]),
       exchange: toText(record["exchange"]),
-      ltp: toNumber(record["ltp"]),
-      changePercent: toNumber(record["changeP"]),
-      financialType: toText(record["financialType"]),
-      period: columns[0] ?? null,
-      columns,
-      quarterData,
-      url: seo ? `${baseUrl}${seo}` : null,
-      nseSymbol: null,
+      events: ["reported" as const],
     };
   });
 }
 
-/** Fetches the page once and parses whichever sections were asked for. */
-export async function scrapeEarnings(
-  sections: "both" | "calendar" | "rapid"
-): Promise<EarningsSections> {
+/**
+ * Fetches the page once and returns every company it lists, collapsed by scId.
+ *
+ * This is not result dedup — every run still emits the full current scan, and
+ * n8n decides what is new. It only stops one company that appears in both
+ * sections from being dumped from the MCP server twice in the same pass; its
+ * `events` then carries both reasons it was picked up.
+ */
+export async function scanEarnings(sections: SectionSelection): Promise<ScrapedRow[]> {
   const dashboard = await fetchEarningsDashboard();
 
-  const result: EarningsSections = {
-    calendarDate: toText(dashboard.resCalTodayDate),
-    calendarRange: {
-      from: toText(dashboard.resCalFromDate),
-      to: toText(dashboard.resCalToDate),
-    },
-    resultCalendar: sections === "rapid" ? [] : parseResultCalendar(dashboard),
-    rapidResults: sections === "calendar" ? [] : parseRapidResults(dashboard),
-  };
+  const calendar = sections === "rapid" ? [] : parseResultCalendar(dashboard);
+  const rapid = sections === "calendar" ? [] : parseRapidResults(dashboard);
+
+  const byScId = new Map<string, ScrapedRow>();
+  const rows: ScrapedRow[] = [];
+  for (const row of [...rapid, ...calendar]) {
+    const seen = row.scId ? byScId.get(row.scId) : undefined;
+    if (seen) {
+      for (const event of row.events) if (!seen.events.includes(event)) seen.events.push(event);
+      continue;
+    }
+    if (row.scId) byScId.set(row.scId, row);
+    rows.push(row); // a row with no scId can't be keyed; keep it so the gap shows
+  }
 
   log.info(
-    `scraped ${result.resultCalendar.length} calendar row(s) and ${result.rapidResults.length} rapid result(s)`
+    `scanned ${rapid.length} reported + ${calendar.length} upcoming = ${rows.length} distinct stock(s)`
   );
-  return result;
+  return rows;
 }

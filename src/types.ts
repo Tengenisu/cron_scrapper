@@ -1,53 +1,36 @@
-/** A company about to report — one row of Moneycontrol's RESULT CALENDAR. */
-export interface CalendarEntry {
-  date: string | null; // "4 Sep"
-  company: string | null;
-  shortName: string | null;
-  scId: string | null; // Moneycontrol id, e.g. "DTL03"
-  exchange: string | null; // "N" | "B"
-  resultType: string | null; // "Q1 FY26-27"
-  ltp: number | null;
-  changePercent: number | null;
-  time: string | null;
-  marketCap: number | null;
-  url: string | null;
-  financialsUrl: string | null;
-  nseSymbol: string | null; // filled in by the symbol resolver
-}
+/**
+ * This repo's job is narrow: find which stocks have results, resolve each one to
+ * a tradeable symbol, hand that symbol to the screener MCP server, and format
+ * what comes back.
+ *
+ * Nothing Moneycontrol itself reports about a company — price, market cap, its
+ * own revenue/profit table — reaches the output. Moneycontrol is used as the
+ * *scan*: which stocks, and what their symbol is. Every number in a snapshot
+ * comes from the MCP server.
+ */
 
-/** One metric row inside a rapid result: Revenue / Gross Profit / Net Profit. */
-export interface QuarterMetric {
-  metric: string | null;
-  current: number | null;
-  previous: number | null;
-  growthPercent: number | null;
-}
+export type Exchange = "NSE" | "BSE";
 
-/** A company that has just reported — one row of Moneycontrol's RAPID RESULTS. */
-export interface RapidResult {
-  date: string | null; // "September 02, 2026"
+/** Why a stock turned up in the scan. */
+export type EarningsEvent = "upcoming" | "reported";
+
+/** One company off the earnings page, reduced to the only things we need. */
+export interface ScrapedRow {
   company: string | null;
-  scId: string | null;
+  scId: string | null; // Moneycontrol id, e.g. "DTL03" — the resolver's input
+  /** Moneycontrol's group code: "N" | "B". A hint, not the answer. */
   exchange: string | null;
-  ltp: number | null;
-  changePercent: number | null;
-  financialType: string | null; // "Consolidated" | "Standalone"
-  period: string | null; // "Q1 FY26-27"
-  columns: string[];
-  quarterData: QuarterMetric[];
-  url: string | null;
-  nseSymbol: string | null;
-}
-
-/** The two sections, as they come out of the page's __NEXT_DATA__ blob. */
-export interface EarningsSections {
-  calendarDate: string | null;
-  calendarRange: { from: string | null; to: string | null };
-  resultCalendar: CalendarEntry[];
-  rapidResults: RapidResult[];
+  /** Both, when a company shows up in the calendar and in rapid results. */
+  events: EarningsEvent[];
 }
 
 export type SectionSelection = "both" | "calendar" | "rapid";
+
+/** What the price feed resolved an scId to. */
+export interface ResolvedSymbol {
+  symbol: string; // "DHOOTTRANS" on the NSE, the scrip code "541735" on the BSE
+  exchange: Exchange;
+}
 
 // --------------------------------------------------------------------------- //
 // Markdown parsed out of an MCP tool's text content
@@ -80,11 +63,13 @@ export interface MarkdownDocument {
 }
 
 // --------------------------------------------------------------------------- //
-// The MCP dump
+// The MCP dump — the raw, per-call layer
 // --------------------------------------------------------------------------- //
 
-/** One entry of the per-symbol job catalogue: label + tool + arguments. */
+/** One entry of the per-symbol job catalogue: slot + label + tool + arguments. */
 export interface McpJobSpec {
+  /** Where this call's answer lands in the formatted document. */
+  slot: string;
   label: string;
   tool: string;
   args: Record<string, unknown>;
@@ -100,6 +85,7 @@ export interface McpJobSpec {
  * — neither fails the run.
  */
 export interface McpJobResult {
+  slot: string;
   label: string;
   tool: string;
   ok: boolean;
@@ -113,26 +99,128 @@ export interface McpJobResult {
   durationMs: number;
 }
 
+export interface McpCounts {
+  total: number;
+  ok: number;
+  failed: number;
+  empty: number;
+  pending: number;
+}
+
 export interface McpDump {
   symbol: string;
+  exchange: Exchange;
   generatedAt: string;
-  counts: { total: number; ok: number; failed: number; empty: number; pending: number };
+  counts: McpCounts;
   jobs: McpJobResult[];
 }
 
-/** What lands in snapshot.mcp[] — one element per resolved NSE symbol. */
-export interface SymbolDump {
-  symbol: string;
-  ok: boolean;
-  /** True when the deadline was hit before this symbol could be dumped at all. */
-  pending?: boolean;
-  error?: string;
-  data?: McpDump;
+// --------------------------------------------------------------------------- //
+// The formatted MCP document — what actually ships
+// --------------------------------------------------------------------------- //
+
+/** screener_get_company_overview, reshaped. */
+export interface CompanyProfile {
+  name: string | null;
+  screenerUrl: string | null;
+  about: string | null;
+  /** topRatios flattened to name -> value ("Stock P/E": "22.6"). */
+  ratios: Record<string, string>;
+  pros: string[];
+  cons: string[];
+}
+
+/** One screener_get_financial_statement answer. */
+export interface FinancialStatement {
+  section: string | null;
+  periods: string[];
+  /** Line item -> one value per period, aligned with `periods`. */
+  rows: Record<string, (string | number | null)[]>;
+}
+
+export interface Financials {
+  quarters: FinancialStatement | null;
+  profitAndLoss: FinancialStatement | null;
+  balanceSheet: FinancialStatement | null;
+  cashFlow: FinancialStatement | null;
+  ratios: FinancialStatement | null;
+}
+
+/** One technical_get_indicator answer, newest point first. */
+export interface Indicator {
+  indicator: string | null;
+  interval: string | null;
+  timePeriod: number | null;
+  /** The newest reading, e.g. {"RSI": "75.48"}. */
+  latest: Record<string, string | number | null> | null;
+  points: { date: string | null; values: Record<string, string | number | null> }[];
+}
+
+export interface SearchMatch {
+  id: string | null;
+  name: string | null;
+  url: string | null;
+}
+
+/** A call that failed or was never made, kept so a gap is never silent. */
+export interface JobIssue {
+  slot: string;
+  label: string;
+  tool: string;
+  reason: "failed" | "pending";
+  error: string | null;
+}
+
+/** Everything the MCP server had to say about one symbol, formatted. */
+export interface StockData {
+  generatedAt: string;
+  profile: CompanyProfile | null;
+  financials: Financials;
+  peers: unknown | null;
+  quote: Record<string, unknown> | null;
+  announcements: unknown[];
+  corporateActions: unknown[];
+  /** Keyed by slot: "RSI14", "SMA50", "EMA200", "MACD". */
+  technicals: Record<string, Indicator>;
+  matches: SearchMatch[];
+  counts: McpCounts;
+  issues: JobIssue[];
 }
 
 // --------------------------------------------------------------------------- //
 // The document this whole thing exists to produce
 // --------------------------------------------------------------------------- //
+
+export type StockStatus =
+  /** Dumped from the MCP server. */
+  | "ok"
+  /** Every MCP call for this symbol failed. */
+  | "failed"
+  /** The run deadline arrived first; the next tick picks it up. */
+  | "pending"
+  /** The price feed had no NSE symbol and no BSE code — nothing to look up. */
+  | "unresolved";
+
+/** One stock: who it is, and what the MCP server returned for it. */
+export interface StockResult {
+  company: string | null;
+  scId: string | null;
+  symbol: string | null;
+  exchange: Exchange | null;
+  events: EarningsEvent[];
+  status: StockStatus;
+  error: string | null;
+  data: StockData | null;
+}
+
+export interface SnapshotCounts {
+  scanned: number;
+  resolved: number;
+  unresolved: number;
+  ok: number;
+  failed: number;
+  pending: number;
+}
 
 export interface EarningsSnapshot {
   ok: true;
@@ -141,22 +229,10 @@ export interface EarningsSnapshot {
   cacheEnabled: boolean;
   scrapedAt: string;
   durationMs: number;
-  calendarDate: string | null;
-  calendarRange: { from: string | null; to: string | null };
-  resultCalendar: CalendarEntry[];
-  rapidResults: RapidResult[];
-  nseSymbols: string[];
-  counts: {
-    resultCalendar: number;
-    rapidResults: number;
-    nseSymbols: number;
-    mcpOk: number;
-    mcpFailed: number;
-    mcpPending: number;
-  };
+  counts: SnapshotCounts;
   /** True when the run deadline cut the MCP step short. */
   truncated: boolean;
-  mcp: SymbolDump[];
+  results: StockResult[];
   files?: WrittenFiles;
 }
 

@@ -3,7 +3,7 @@ import { markdownToDocument } from "../services/markdown.js";
 import { formatDuration, truncate } from "../services/format.js";
 import { log } from "../services/log.js";
 import { buildJobCatalog } from "./catalog.js";
-import type { McpDump, McpJobResult, McpJobSpec, SymbolDump } from "../types.js";
+import type { Exchange, McpDump, McpJobResult, McpJobSpec } from "../types.js";
 
 /**
  * Runs the job catalogue for one symbol and shapes each answer into JSON.
@@ -33,6 +33,7 @@ async function runJob(spec: McpJobSpec): Promise<McpJobResult> {
   const call = await callTool(spec.tool, spec.args);
 
   const base = {
+    slot: spec.slot,
     label: spec.label,
     tool: spec.tool,
     raw: call.text,
@@ -68,6 +69,7 @@ async function runJob(spec: McpJobSpec): Promise<McpJobResult> {
 
 function pendingJob(spec: McpJobSpec): McpJobResult {
   return {
+    slot: spec.slot,
     label: spec.label,
     tool: spec.tool,
     ok: true,
@@ -80,20 +82,25 @@ function pendingJob(spec: McpJobSpec): McpJobResult {
 }
 
 /**
- * Dumps one NSE symbol: every catalogue job, in order, against the MCP server.
+ * Dumps one stock: every catalogue job for its exchange, in order, against the
+ * MCP server.
  *
  * `deadlineAt` is a wall-clock cutoff for the whole pass. Once it passes, the
  * remaining jobs are marked `pending` instead of being fired, so a slow MCP
  * server degrades into a partial dump rather than an endless run.
+ *
+ * This is the raw layer — one entry per call, with `raw` text kept. `formatDump`
+ * turns it into the document that actually ships.
  */
 export async function dumpSymbol(
   symbol: string,
+  exchange: Exchange,
   options: { consolidated?: boolean; limit?: number; deadlineAt?: number } = {}
-): Promise<SymbolDump> {
-  const jobs = buildJobCatalog(symbol, options);
+): Promise<McpDump> {
+  const jobs = buildJobCatalog(symbol, exchange, options);
   const startedAt = Date.now();
   const deadlineAt = options.deadlineAt ?? Infinity;
-  log.info(`MCP dump ${symbol} (${jobs.length} calls)`);
+  log.info(`MCP dump ${symbol} [${exchange}] (${jobs.length} calls)`);
 
   const results: McpJobResult[] = [];
   for (const spec of jobs) {
@@ -108,32 +115,17 @@ export async function dumpSymbol(
     pending: results.filter((job) => job.pending).length,
   };
 
-  const dump: McpDump = {
-    symbol,
-    generatedAt: new Date().toISOString(),
-    counts,
-    jobs: results,
-  };
-
   log.info(
     `MCP dump ${symbol} done in ${formatDuration(Date.now() - startedAt)} ` +
       `(ok ${counts.ok}, failed ${counts.failed}, empty ${counts.empty}` +
       `${counts.pending ? `, pending ${counts.pending}` : ""})`
   );
 
-  if (counts.pending === counts.total) {
-    return { symbol, ok: false, pending: true, error: "run deadline reached before this symbol was dumped", data: dump };
-  }
+  return { symbol, exchange, generatedAt: new Date().toISOString(), counts, jobs: results };
+}
 
-  if (counts.failed === counts.total) {
-    const first = results[0];
-    return {
-      symbol,
-      ok: false,
-      error: truncate(first?.error ?? "every MCP call failed", 500),
-      data: dump,
-    };
-  }
-
-  return { symbol, ok: true, data: dump };
+/** The first real error in a dump — what to put on a stock that came back failed. */
+export function firstError(dump: McpDump): string {
+  const failed = dump.jobs.find((job) => !job.ok && job.error);
+  return truncate(failed?.error ?? "every MCP call failed", 500);
 }

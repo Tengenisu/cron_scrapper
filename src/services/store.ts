@@ -3,7 +3,7 @@ import path from "node:path";
 import { DATA_DIR, KEEP_RUNS } from "../constants.js";
 import { errorMessage } from "./format.js";
 import { log } from "./log.js";
-import type { EarningsSnapshot, WrittenFiles } from "../types.js";
+import type { EarningsSnapshot, StockResult, WrittenFiles } from "../types.js";
 
 /**
  * Where a run's data actually lands.
@@ -12,11 +12,16 @@ import type { EarningsSnapshot, WrittenFiles } from "../types.js";
  *
  *   data/latest.json                  the newest snapshot (what n8n reads)
  *   data/runs/earnings-<stamp>.json   one file per run, pruned to KEEP_RUNS
- *   data/symbols/<SYMBOL>.json        the newest MCP dump per symbol
+ *   data/symbols/<SYMBOL>.json        the newest formatted result per symbol
  *   data/history.jsonl                one summary line per run, appended
  */
 
 const RUN_FILE = /^earnings-.*\.json$/;
+
+/** A BSE code is digits and an NSE symbol can carry &, - or spaces — keep it a filename. */
+function symbolFile(symbol: string): string {
+  return symbol.replace(/[^A-Za-z0-9._-]+/g, "_");
+}
 
 function writeJson(file: string, value: unknown): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -30,9 +35,10 @@ export function writeSnapshot(snapshot: EarningsSnapshot, dataDir: string = DATA
   const latestFile = path.join(dataDir, "latest.json");
   const historyFile = path.join(dataDir, "history.jsonl");
 
-  const symbolFiles = snapshot.mcp
-    .filter((dump) => dump.data)
-    .map((dump) => path.join(dataDir, "symbols", `${dump.symbol}.json`));
+  const dumped = snapshot.results.filter(
+    (result): result is StockResult & { symbol: string } => Boolean(result.symbol && result.data)
+  );
+  const symbolFiles = dumped.map((result) => path.join(dataDir, "symbols", `${symbolFile(result.symbol)}.json`));
 
   // Attach the manifest before writing, so the document on disk and the one on
   // stdout are byte-for-byte the same.
@@ -42,9 +48,8 @@ export function writeSnapshot(snapshot: EarningsSnapshot, dataDir: string = DATA
   writeJson(runFile, snapshot);
   writeJson(latestFile, snapshot);
 
-  for (const dump of snapshot.mcp) {
-    if (!dump.data) continue;
-    writeJson(path.join(dataDir, "symbols", `${dump.symbol}.json`), dump);
+  for (const result of dumped) {
+    writeJson(path.join(dataDir, "symbols", `${symbolFile(result.symbol)}.json`), result);
   }
 
   appendHistory(historyFile, snapshot);
@@ -60,7 +65,9 @@ function appendHistory(file: string, snapshot: EarningsSnapshot): void {
     scrapedAt: snapshot.scrapedAt,
     durationMs: snapshot.durationMs,
     counts: snapshot.counts,
-    nseSymbols: snapshot.nseSymbols,
+    symbols: snapshot.results
+      .filter((result) => result.symbol)
+      .map((result) => `${result.symbol}:${result.exchange}`),
   };
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });

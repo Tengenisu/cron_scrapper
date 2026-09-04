@@ -10,21 +10,27 @@ import {
 } from "./constants.js";
 import { RunLock } from "./services/lock.js";
 import { checkMcpHealth } from "./services/mcp.js";
-import { scrapeEarnings } from "./services/moneycontrol.js";
+import { scanEarnings } from "./services/moneycontrol.js";
 import { SymbolResolver } from "./services/symbols.js";
 import { writeSnapshot } from "./services/store.js";
 import { errorMessage, fileTimestamp, formatDuration, localIsoTimestamp, mapWithConcurrency } from "./services/format.js";
 import { log } from "./services/log.js";
-import { dumpSymbol } from "./tools/dump.js";
+import { dumpSymbol, firstError } from "./tools/dump.js";
+import { formatDump } from "./tools/format.js";
 import type { CliOptions } from "./schemas/index.js";
-import type { EarningsSnapshot, RunResult, SymbolDump } from "./types.js";
+import type { EarningsSnapshot, ResolvedSymbol, RunResult, ScrapedRow, StockResult } from "./types.js";
 
 /**
- * One full pass: scrape → resolve NSE symbols → dump each symbol from the MCP
- * server → assemble one JSON document → write it to data/.
+ * One full pass: lock → scan the earnings page for stocks → resolve each to an
+ * NSE symbol or BSE code → dump that symbol from the MCP server → format what
+ * came back → write it.
  *
- * No dedup is done. Every run emits the current full snapshot and n8n decides
- * what is new.
+ * The scan is the only thing Moneycontrol is used for. Nothing it reports about
+ * a company — price, market cap, its own results table — is carried into the
+ * output: every figure in a snapshot came from the MCP server.
+ *
+ * No dedup is done across runs. Every run emits the current full scan and n8n
+ * decides what is new.
  */
 export async function runOnce(options: Pick<CliOptions, "section" | "enrich" | "useLock">): Promise<RunResult> {
   const lock = new RunLock(options.useLock ? LOCK_FILE : "", LOCK_STALE_MS);
@@ -39,10 +45,12 @@ export async function runOnce(options: Pick<CliOptions, "section" | "enrich" | "
   try {
     const snapshot = await collect(options, startedAt);
     if (WRITE_DATA_FILES) snapshot.files = writeSnapshot(snapshot);
+    const { counts } = snapshot;
     log.info(
       `run ${snapshot.runId} finished in ${formatDuration(snapshot.durationMs)} — ` +
-        `${snapshot.counts.nseSymbols} symbol(s), ${snapshot.counts.mcpFailed} MCP failure(s)` +
-        `${snapshot.truncated ? `, ${snapshot.counts.mcpPending} pending (deadline)` : ""}`
+        `${counts.scanned} stock(s), ${counts.ok} dumped, ${counts.failed} failed, ` +
+        `${counts.unresolved} unresolved` +
+        `${snapshot.truncated ? `, ${counts.pending} pending (deadline)` : ""}`
     );
     return snapshot;
   } catch (err) {
@@ -54,28 +62,46 @@ export async function runOnce(options: Pick<CliOptions, "section" | "enrich" | "
   }
 }
 
+/** A scanned row plus whatever the price feed made of it. */
+interface Candidate {
+  row: ScrapedRow;
+  resolved: ResolvedSymbol | null;
+}
+
 async function collect(
   options: Pick<CliOptions, "section" | "enrich">,
   startedAt: number
 ): Promise<EarningsSnapshot> {
-  const sections = await scrapeEarnings(options.section);
-  const records = [...sections.resultCalendar, ...sections.rapidResults];
+  const rows = await scanEarnings(options.section);
 
   const resolver = new SymbolResolver();
-  for (const record of records) {
-    record.nseSymbol = await resolver.resolve(record.scId, record.exchange);
+  const candidates: Candidate[] = [];
+  for (const row of rows) {
+    candidates.push({ row, resolved: await resolver.resolve(row.scId, row.exchange) });
   }
   resolver.save();
 
-  // Stocks listed only on the BSE come back with nseSymbol: null and are
-  // excluded here — there is nothing for the screener MCP server to look up.
-  const symbols = [...new Set(records.map((r) => r.nseSymbol).filter((s): s is string => Boolean(s)))].sort();
-  log.info(`resolved ${symbols.length} NSE symbol(s): ${symbols.join(", ") || "—"}`);
+  const resolved = candidates.filter((candidate) => candidate.resolved !== null);
+  log.info(
+    `resolved ${resolved.length}/${candidates.length} stock(s): ` +
+      (resolved.map((c) => `${c.resolved!.symbol}[${c.resolved!.exchange}]`).join(", ") || "—")
+  );
 
   // Everything above is cheap; the MCP step is what can drag, so the deadline is
   // measured from the start of the run and only ever cuts that step short.
   const deadlineAt = RUN_DEADLINE_MS > 0 ? startedAt + RUN_DEADLINE_MS : Infinity;
-  const mcp = options.enrich ? await dumpSymbols(symbols, deadlineAt) : [];
+  const results = options.enrich
+    ? await dumpAll(candidates, deadlineAt)
+    : candidates.map((candidate) => toResult(candidate));
+
+  const counts = {
+    scanned: results.length,
+    resolved: resolved.length,
+    unresolved: results.filter((result) => result.status === "unresolved").length,
+    ok: results.filter((result) => result.status === "ok").length,
+    failed: results.filter((result) => result.status === "failed").length,
+    pending: results.filter((result) => result.status === "pending").length,
+  };
 
   return {
     ok: true,
@@ -84,49 +110,87 @@ async function collect(
     cacheEnabled: CACHE_ENABLED,
     scrapedAt: localIsoTimestamp(),
     durationMs: Date.now() - startedAt,
-    calendarDate: sections.calendarDate,
-    calendarRange: sections.calendarRange,
-    resultCalendar: sections.resultCalendar,
-    rapidResults: sections.rapidResults,
-    nseSymbols: symbols,
-    counts: {
-      resultCalendar: sections.resultCalendar.length,
-      rapidResults: sections.rapidResults.length,
-      nseSymbols: symbols.length,
-      mcpOk: mcp.filter((dump) => dump.ok).length,
-      mcpFailed: mcp.filter((dump) => !dump.ok && !dump.pending).length,
-      mcpPending: mcp.filter((dump) => dump.pending).length,
-    },
-    truncated: mcp.some((dump) => dump.pending || dump.data?.counts.pending),
-    mcp,
+    counts,
+    truncated: results.some(
+      (result) => result.status === "pending" || (result.data?.counts.pending ?? 0) > 0
+    ),
+    results,
   };
 }
 
-async function dumpSymbols(symbols: string[], deadlineAt: number): Promise<SymbolDump[]> {
-  if (symbols.length === 0) return [];
+/** The identity half of a result — everything before the MCP server is asked. */
+function toResult(candidate: Candidate, overrides: Partial<StockResult> = {}): StockResult {
+  const { row, resolved } = candidate;
+  return {
+    company: row.company,
+    scId: row.scId,
+    symbol: resolved?.symbol ?? null,
+    exchange: resolved?.exchange ?? null,
+    events: row.events,
+    status: resolved ? "ok" : "unresolved",
+    error: resolved ? null : "no NSE symbol or BSE code for this scId",
+    data: null,
+    ...overrides,
+  };
+}
+
+async function dumpAll(candidates: Candidate[], deadlineAt: number): Promise<StockResult[]> {
+  const dumpable = candidates.filter((candidate) => candidate.resolved !== null);
+  if (dumpable.length === 0) return candidates.map((candidate) => toResult(candidate));
 
   // One probe up front: a dead endpoint is worth reporting once, not as the same
-  // connection error repeated 19 times per symbol.
+  // connection error repeated for every call of every symbol.
   const health = await checkMcpHealth();
   if (!health.ok) {
     log.error(`MCP endpoint ${MCP_ENDPOINT} is not answering: ${health.error}`);
-    return symbols.map((symbol) => ({
-      symbol,
-      ok: false,
-      error: `MCP endpoint ${MCP_ENDPOINT} unreachable: ${health.error}`,
-    }));
+    const error = `MCP endpoint ${MCP_ENDPOINT} unreachable: ${health.error}`;
+    return candidates.map((candidate) =>
+      candidate.resolved ? toResult(candidate, { status: "failed", error }) : toResult(candidate)
+    );
   }
 
-  const dumps = await mapWithConcurrency(symbols, MCP_CONCURRENCY, (symbol) =>
-    dumpSymbol(symbol, { deadlineAt })
-  );
+  const dumped = new Map<Candidate, StockResult>();
+  await mapWithConcurrency(dumpable, MCP_CONCURRENCY, async (candidate) => {
+    const { symbol, exchange } = candidate.resolved!;
+    const dump = await dumpSymbol(symbol, exchange, { deadlineAt });
+    const data = formatDump(dump);
 
-  const pending = dumps.filter((dump) => dump.pending || dump.data?.counts.pending).length;
+    // Never called at all: the deadline arrived first. Not a failure — the next
+    // tick picks it up, and the snapshot is marked truncated.
+    if (dump.counts.pending === dump.counts.total) {
+      dumped.set(
+        candidate,
+        toResult(candidate, {
+          status: "pending",
+          error: "run deadline reached before this stock was dumped",
+          data,
+        })
+      );
+      return;
+    }
+
+    dumped.set(
+      candidate,
+      toResult(candidate, {
+        status: dump.counts.failed === dump.counts.total ? "failed" : "ok",
+        error: dump.counts.failed === dump.counts.total ? firstError(dump) : null,
+        data,
+      })
+    );
+  });
+
+  // Rebuilt in scan order: concurrency decides finish order, and a snapshot that
+  // reshuffles its own rows between runs is a nuisance to diff.
+  const results = candidates.map((candidate) => dumped.get(candidate) ?? toResult(candidate));
+
+  const pending = results.filter(
+    (result) => result.status === "pending" || (result.data?.counts.pending ?? 0) > 0
+  ).length;
   if (pending > 0) {
     log.warn(
-      `run deadline reached — ${pending} symbol(s) left partial or undumped. ` +
+      `run deadline reached — ${pending} stock(s) left partial or undumped. ` +
         `Raise RUN_DEADLINE_MS, or find out why the MCP server is slow.`
     );
   }
-  return dumps;
+  return results;
 }

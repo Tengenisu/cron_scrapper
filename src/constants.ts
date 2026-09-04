@@ -40,9 +40,10 @@ export const EARNINGS_URL = envString("EARNINGS_URL", "https://www.moneycontrol.
 
 /**
  * Moneycontrol's price feed — the only way to translate a Moneycontrol scId
- * (e.g. "DTL03") into an NSE trading symbol (e.g. "DHOOTTRANS"). The scId from
- * the page is authoritative; the trailing token in the stock URL is a *different*
- * id and resolves to the wrong company.
+ * (e.g. "DTL03") into a symbol the MCP server understands: an NSE ticker
+ * ("DHOOTTRANS"), or a BSE scrip code ("541735") for a stock with no NSE
+ * listing. The scId from the page is authoritative; the trailing token in the
+ * stock URL is a *different* id and resolves to the wrong company.
  */
 export const PRICE_FEED_URL = envString(
   "PRICE_FEED_URL",
@@ -88,18 +89,19 @@ export const SYMBOL_CACHE_FILE = CACHE_ENABLED
 // --------------------------------------------------------------------------- //
 // The MCP step
 //
-// Each resolved NSE symbol is dumped from the screener MCP server: one JSON-RPC
-// tools/call per entry in the job catalogue (see src/tools/catalog.ts).
+// Each resolved stock is dumped from the screener MCP server: one JSON-RPC
+// tools/call per entry in the job catalogue (see src/tools/catalog.ts), then
+// formatted by src/tools/format.ts into the document that ships.
 // --------------------------------------------------------------------------- //
 
 export const MCP_ENDPOINT = envString("MCP_ENDPOINT", "http://127.0.0.1:3123/mcp");
 /**
- * Per MCP call. Deliberately short: 19 calls x N symbols means a generous
+ * Per MCP call. Deliberately short: 12-15 calls x N stocks means a generous
  * timeout here is what turns one slow upstream into a pass that runs for ten
  * minutes. A screener call that hasn't answered in 30s is not going to.
  */
 export const MCP_TIMEOUT_MS = envNumber("MCP_TIMEOUT_MS", 30_000);
-/** How many symbols are dumped at once. Keep it low; the MCP server throttles upstream anyway. */
+/** How many stocks are dumped at once. Keep it low; the MCP server throttles upstream anyway. */
 export const MCP_CONCURRENCY = Math.max(1, envNumber("MCP_CONCURRENCY", 2));
 export const MCP_CONSOLIDATED = envBool("MCP_CONSOLIDATED", true);
 export const MCP_LIST_LIMIT = envNumber("MCP_LIST_LIMIT", 10);
@@ -114,7 +116,7 @@ export const MCP_LIST_LIMIT = envNumber("MCP_LIST_LIMIT", 10);
 
 /**
  * Hard ceiling on one pass, so a slow or half-dead MCP server can never run past
- * the next tick. When it is hit, the symbols still queued come back as
+ * the next tick. When it is hit, the stocks still queued come back as
  * `pending` and the snapshot is marked `truncated` — a partial answer, written
  * and returned on time, beats a run that never ends. 0 disables the ceiling.
  *
@@ -139,7 +141,7 @@ export const KEEP_RUNS = envNumber("KEEP_RUNS", 50);
 // --------------------------------------------------------------------------- //
 // Run lock
 //
-// A pass over ~8 symbols takes minutes, which is close enough to the 5-minute
+// A pass over ~10 stocks takes minutes, which is close enough to the 5-minute
 // cadence that ticks can overlap. Runs are serialised with a lock file: a tick
 // that finds a run in flight exits immediately with {"ok": true, "skipped": true}.
 //

@@ -12,7 +12,7 @@
 #      crond. That is what render.yaml and the Docker/Windows notes in the
 #      README use.
 #
-# A pass over ~8 symbols takes a couple of minutes, which is close enough to a
+# A pass over ~10 stocks takes a couple of minutes, which is close enough to a
 # 5-minute cadence that ticks can overlap. A tick that lands while the previous
 # pass is still running is dropped by the lock file and prints
 # {"ok": true, "skipped": true}, so nothing stacks up.
